@@ -1,6 +1,11 @@
 """
-parser.py - Parse network (.xlsm/.xlsx) and execution (.xls/.xlsx/.csv) files
-for the transport network delay analysis application.
+parser.py - Parse network (.xlsm/.xlsx) and execution (.xls/.xlsx/.csv) files.
+
+Supports TWO network file formats:
+  A) Original weekly .xlsm  → sheets: 'Horários', 'Resumo', 'Rotas'
+     (Rede_Transportes_Base_YYYYMMDD.xlsm)
+  B) Generated summary .xlsx → sheets named 'R1', 'R1_Exp', 'R2', ...
+     (Encadeamento_Rede_Transportes.xlsx)
 """
 from __future__ import annotations
 
@@ -8,7 +13,7 @@ import io
 import re
 import datetime
 import logging
-from typing import Optional, Union
+from typing import Optional
 
 import pandas as pd
 import openpyxl
@@ -20,79 +25,44 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _REVERSE_KEYWORDS = [
-    "vazi",          # covers: vazio, vazia, vazias, contentores vazios, paletes vazias
-    "retorno",
-    "inversa",       # covers: logistica inversa, logística inversa
-    "empty",
-    "paletes v",
-    "contentores v",
+    "vazi", "retorno", "inversa", "empty", "paletes v", "contentores v",
 ]
-
-_REVERSE_NAME_TOKENS = ["rib", "rb"]   # checked as whole word / suffix in route name
+_REVERSE_NAME_TOKENS = ["rib", "rb"]
 
 
 def detect_reverse_logistics(route: dict) -> bool:
-    """Return True when the route is a reverse-logistics (empty return) leg.
-
-    Detection criteria (any one sufficient):
-    1. Route name (designacao) or observation (obs) contain a reverse keyword.
-    2. Route name contains 'RIB' or ends with 'RB' as a token.
-    3. Last stop has the same stop-code / name as the first stop (round-trip).
-    """
     name = (route.get("designacao") or "").lower()
     obs  = (route.get("obs") or "").lower()
-
-    # Keyword match in name or obs
     if any(k in name or k in obs for k in _REVERSE_KEYWORDS):
         return True
-
-    # Token match for RIB / RB in name
     for token in _REVERSE_NAME_TOKENS:
-        # Match as whole word boundaries using simple split check
         if token in name.split() or name.endswith(f"-{token}") or name.endswith(f" {token}"):
             return True
-
-    # Round-trip: last stop == first stop (by paragem name)
     stops = route.get("stops", [])
     if len(stops) >= 2:
-        first_name = (stops[0].get("paragem") or "").strip().lower()
-        last_name  = (stops[-1].get("paragem") or "").strip().lower()
-        if first_name and first_name == last_name:
+        first = (stops[0].get("paragem") or "").strip().lower()
+        last  = (stops[-1].get("paragem") or "").strip().lower()
+        if first and first == last:
             return True
-
     return False
 
 
 def find_reverse_leg_from(route: dict) -> Optional[int]:
-    """Return the index of the stop where the return leg begins, or None.
-
-    For a round-trip route the return point is the stop with the highest km
-    (turnaround point) — heuristically the middle stop for simple out-and-back
-    routes.  Returns None when the route is not a round-trip.
-    """
     stops = route.get("stops", [])
     if len(stops) < 2:
         return None
-
-    first_name = (stops[0].get("paragem") or "").strip().lower()
-    last_name  = (stops[-1].get("paragem") or "").strip().lower()
-    if not (first_name and first_name == last_name):
+    first = (stops[0].get("paragem") or "").strip().lower()
+    last  = (stops[-1].get("paragem") or "").strip().lower()
+    if not (first and first == last):
         return None
-
-    # Find the stop with maximum accumulated km (turnaround)
-    max_km = -1
-    max_idx = len(stops) // 2  # fallback: midpoint
+    max_km, max_idx = -1, len(stops) // 2
     for i, s in enumerate(stops):
-        km = s.get("km")
-        if km is not None:
-            try:
-                km_f = float(km)
-                if km_f > max_km:
-                    max_km = km_f
-                    max_idx = i
-            except (ValueError, TypeError):
-                pass
-
+        try:
+            km_f = float(s.get("km") or 0)
+            if km_f > max_km:
+                max_km, max_idx = km_f, i
+        except (ValueError, TypeError):
+            pass
     return max_idx if max_idx > 0 else None
 
 
@@ -101,24 +71,17 @@ def find_reverse_leg_from(route: dict) -> Optional[int]:
 # ---------------------------------------------------------------------------
 
 def _time_to_minutes(t) -> Optional[int]:
-    """Convert a time value to minutes since midnight.
-
-    Accepts:
-    - datetime.time objects
-    - HH:MM strings
-    - HH:MM:SS strings
-    - None / empty → None
-    """
     if t is None:
         return None
     if isinstance(t, datetime.time):
         return t.hour * 60 + t.minute
+    if isinstance(t, datetime.datetime):
+        return t.hour * 60 + t.minute
     if isinstance(t, (int, float)):
-        # Might be an Excel serial or already minutes – ignore
         return None
     s = str(t).strip()
-    if not s or s in ("00:00", "0:00"):
-        return 0
+    if not s:
+        return None
     m = re.match(r"^(\d{1,2}):(\d{2})(?::\d{2})?$", s)
     if m:
         return int(m.group(1)) * 60 + int(m.group(2))
@@ -126,195 +89,138 @@ def _time_to_minutes(t) -> Optional[int]:
 
 
 def _fix_overnight(stops: list[dict]) -> list[dict]:
-    """Adjust times for routes that cross midnight.
-
-    If a departure time at stop N is less than the arrival time at stop N-1
-    we assume midnight was crossed and add 1440 (24h in minutes).
-    """
     if not stops:
         return stops
-
-    prev_dep = stops[0].get("hpp")
-    if prev_dep is None:
-        prev_dep = stops[0].get("hpc") or 0
-
+    prev = stops[0].get("hpp") or stops[0].get("hpc") or 0
     for stop in stops[1:]:
         for key in ("hpc", "hpp"):
             val = stop.get(key)
-            if val is not None and val < prev_dep - 30:
+            if val is not None and val < prev - 30:
                 stop[key] = val + 1440
-        dep = stop.get("hpp")
+        dep = stop.get("hpp") or stop.get("hpc")
         if dep is not None:
-            prev_dep = dep
-        elif stop.get("hpc") is not None:
-            prev_dep = stop["hpc"]
-
+            prev = dep
     return stops
 
 
+def _fmt_minutes(minutes: Optional[int]) -> str:
+    if minutes is None:
+        return ""
+    h, m = divmod(int(minutes) % 1440, 60)
+    return f"{h:02d}:{m:02d}"
+
+
 # ---------------------------------------------------------------------------
-# Network file parser (Encadeamento_Rede_Transportes.xlsx / Rede_Transportes_Base_YYYYMMDD.xlsm)
+# FORMAT A — Original weekly .xlsm  (sheet: 'Horários')
 # ---------------------------------------------------------------------------
 
-# Sheets that contain route stop data (detail sheets)
-_DETAIL_SHEET_PREFIXES = ("R1", "R2", "R3")
-_SUMMARY_SHEET = "Resumo Geral"
-
-# Columns expected in detail sheets (positional, 0-indexed)
-# Col 0: Carreira, 1: Designação, 2: Transportador, 3: Viatura,
-# 4: Periodicidade, 5: N.ºPar, 6: Paragem, 7: H.Chegada, 8: H.Partida,
-# 9: T.Paragem(min), 10: T.Trânsito(min), 11: Km Acum., 12: Tipo
-
-_COL_CARREIRA = 0
-_COL_DESIG = 1
-_COL_TRANSP = 2
-_COL_VIATURA = 3
-_COL_PERIOD = 4
-_COL_NPAR = 5
-_COL_PARAGEM = 6
-_COL_HCHEG = 7
-_COL_HPART = 8
-_COL_TPAR = 9
-_COL_TTRAN = 10
-_COL_KM = 11
-_COL_TIPO = 12
-
-
-def _is_header_row(row) -> bool:
-    """Return True if this is the column-header row (not a data row)."""
-    return str(row[0]).strip() in ("Carreira", "[")
-
-
-def _is_route_title_row(row) -> bool:
-    """A block title row starts with '[' in col 0 and has None in all others."""
-    val = str(row[0]).strip() if row[0] is not None else ""
-    return val.startswith("[") and all(row[i] is None for i in range(1, min(len(row), 5)))
-
-
-def _is_separator_row(row) -> bool:
-    return all(v is None for v in row)
-
-
-def _infer_rede_from_sheet(sheet_name: str) -> str:
-    """Infer the 'rede' type (R1/R2/R3) from the sheet name."""
-    if sheet_name.startswith("R3"):
-        return "R3"
-    if sheet_name.startswith("R2"):
-        return "R2"
-    return "R1"
-
-
-def _infer_region_from_sheet(sheet_name: str) -> str:
-    """Best-effort region from sheet name suffix."""
-    mapping = {
-        "EIB": "EIB",
-        "Exp": "Exp",
-        "MAR": "MAR",
-        "OIR": "OIR",
-        "RB": "RB",
-        "RIB": "RIB",
-        "Clientes": "Clientes",
-    }
-    for k, v in mapping.items():
-        if k in sheet_name:
-            return v
-    return "Nacional"
-
-
-def _parse_detail_sheet(ws, sheet_name: str) -> list[dict]:
-    """Parse one detail sheet and return a list of route dicts."""
-    rede = _infer_rede_from_sheet(sheet_name)
-    region = _infer_region_from_sheet(sheet_name)
-
+def _parse_horarios_sheet(ws, resumo_dict: dict) -> list[dict]:
+    """Parse the 'Horários' sheet from the original weekly .xlsm."""
     routes: list[dict] = []
     current: Optional[dict] = None
 
-    for row_raw in ws.iter_rows(min_row=1, values_only=True):
+    for row_raw in ws.iter_rows(values_only=True):
         row = list(row_raw)
-        # Pad short rows
         while len(row) < 13:
             row.append(None)
 
-        if _is_header_row(row):
-            continue
+        v0 = row[0]
 
-        if _is_route_title_row(row):
-            # Save previous route
+        # --- Block header rows ---
+        if v0 == "Carreira":
+            # Save previous
             if current and current.get("stops"):
                 current["stops"] = _fix_overnight(current["stops"])
                 routes.append(current)
-            current = None
-            continue
-
-        if _is_separator_row(row):
-            if current and current.get("stops"):
-                current["stops"] = _fix_overnight(current["stops"])
-                routes.append(current)
-            current = None
-            continue
-
-        # Data row – col 0 should be numeric carreira code
-        carreira_raw = row[_COL_CARREIRA]
-        if carreira_raw is None:
-            continue
-
-        try:
-            carreira = int(carreira_raw)
-        except (ValueError, TypeError):
-            continue
-
-        # First data row of a new route – initialise the dict
-        if current is None or current.get("carreira") != carreira:
-            if current and current.get("stops"):
-                current["stops"] = _fix_overnight(current["stops"])
-                routes.append(current)
+            # Extract carreira code from col 1
+            cod = row[1]
+            try:
+                cod = int(float(str(cod).strip()))
+            except (ValueError, TypeError):
+                cod = str(cod).strip() if cod else None
+            # Look up metadata from Resumo
+            meta = resumo_dict.get(cod, {})
             current = {
-                "carreira": carreira,
-                "designacao": str(row[_COL_DESIG] or "").strip(),
-                "transportador": str(row[_COL_TRANSP] or "").strip(),
-                "veiculo": str(row[_COL_VIATURA] or "").strip(),
-                "periodicidade": str(row[_COL_PERIOD] or "").strip(),
-                "rede": rede,
-                "regiao": region,
-                "stops": [],
+                "carreira":      cod,
+                "designacao":    None,
+                "periodicidade": None,
+                "transportador": None,
+                "veiculo":       None,
+                "rede":          str(meta.get("rede", "") or "").strip(),
+                "regiao":        str(meta.get("regiao", "") or "").strip(),
+                "origem":        str(meta.get("origem", "") or "").strip(),
+                "destino":       str(meta.get("destino", "") or "").strip(),
+                "stops":         [],
             }
+            continue
 
-        hpc = _time_to_minutes(row[_COL_HCHEG])
-        hpp = _time_to_minutes(row[_COL_HPART])
+        if current is None:
+            continue
 
+        if v0 == "Designação":
+            current["designacao"] = str(row[1] or "").strip()
+            continue
+        if v0 == "Periodicidade":
+            current["periodicidade"] = str(row[1] or "").strip()
+            continue
+        if v0 == "Transportador":
+            current["transportador"] = str(row[1] or "").strip()
+            continue
+        if v0 == "Viatura":
+            current["veiculo"] = str(row[1] or "").strip()
+            continue
+        if v0 in ("Código", "Codigo", "Código "):
+            continue  # column header row
+
+        # Empty row = block separator
+        if all(v is None for v in row):
+            if current and current.get("stops"):
+                current["stops"] = _fix_overnight(current["stops"])
+                routes.append(current)
+            current = None
+            continue
+
+        # Numeric first col = stop data row
+        # Format: [stop_code, stop_name, n_par, hpc, hpp, tp, tt, km, vm, ...]
         try:
-            npar = int(row[_COL_NPAR]) if row[_COL_NPAR] is not None else None
+            int(float(str(v0)))
         except (ValueError, TypeError):
-            npar = None
+            continue
+
+        stop_name = str(row[1] or "").strip()
+        try:
+            n_par = int(row[2]) if row[2] is not None else None
+        except (ValueError, TypeError):
+            n_par = None
+
+        hpc = _time_to_minutes(row[3])
+        hpp = _time_to_minutes(row[4])
 
         try:
-            tp = float(row[_COL_TPAR]) if row[_COL_TPAR] is not None else None
+            tp = float(row[5]) if row[5] is not None else None
         except (ValueError, TypeError):
             tp = None
-
         try:
-            tt = float(row[_COL_TTRAN]) if row[_COL_TTRAN] is not None else None
+            tt = float(row[6]) if row[6] is not None else None
         except (ValueError, TypeError):
             tt = None
-
         try:
-            km = float(row[_COL_KM]) if row[_COL_KM] is not None else None
+            km = float(row[7]) if row[7] is not None else None
         except (ValueError, TypeError):
             km = None
 
-        stop = {
-            "paragem": str(row[_COL_PARAGEM] or "").strip(),
-            "n_par": npar,
-            "hpc": hpc,
-            "hpp": hpp,
-            "tp": tp,
-            "tt": tt,
-            "km": km,
-            "tipo": str(row[_COL_TIPO] or "").strip(),
-        }
-        current["stops"].append(stop)
+        current["stops"].append({
+            "paragem": stop_name,
+            "n_par":   n_par,
+            "hpc":     hpc,
+            "hpp":     hpp,
+            "tp":      tp,
+            "tt":      tt,
+            "km":      km,
+            "tipo":    "",
+        })
 
-    # Flush last route
+    # Flush last
     if current and current.get("stops"):
         current["stops"] = _fix_overnight(current["stops"])
         routes.append(current)
@@ -322,42 +228,226 @@ def _parse_detail_sheet(ws, sheet_name: str) -> list[dict]:
     return routes
 
 
-def _parse_summary_sheet(ws) -> dict[int, dict]:
-    """Parse the Resumo Geral sheet → {carreira: summary_dict}."""
-    summary: dict[int, dict] = {}
+def _parse_resumo_sheet(ws) -> dict:
+    """Parse 'Resumo' sheet → {carreira_int: meta_dict}."""
+    result = {}
     headers = None
-    for row in ws.iter_rows(min_row=1, values_only=True):
+    for row in ws.iter_rows(values_only=True):
         if headers is None:
             headers = [str(c or "").strip() for c in row]
             continue
-        if row[0] is None:
+        if not row[0]:
             continue
         try:
-            carreira = int(row[0])
+            car = int(float(str(row[0])))
         except (ValueError, TypeError):
             continue
-        record: dict = {}
+        meta = {}
         for i, h in enumerate(headers):
             if i < len(row):
-                record[h] = row[i]
-        summary[carreira] = record
-    return summary
+                meta[h] = row[i]
+        # Normalise keys we care about
+        result[car] = {
+            "rede":    str(meta.get("Rede", "") or "").strip(),
+            "regiao":  str(meta.get("Região", "") or "").strip(),
+            "veiculo": str(meta.get("Veículo", "") or "").strip(),
+            "km":      meta.get("Km"),
+            "origem":  str(meta.get("GE Origem", "") or "").strip(),
+            "destino": str(meta.get("GE Destino", "") or "").strip(),
+        }
+    return result
 
+
+def _parse_rotas_sheet(ws) -> dict:
+    """Parse 'Rotas' sheet → {carreira_int: rota_dict} with origem/destino."""
+    result = {}
+    headers = None
+    for row in ws.iter_rows(values_only=True):
+        if headers is None:
+            headers = [str(c or "").strip() for c in row]
+            continue
+        if not row[0]:
+            continue
+        try:
+            car = int(float(str(row[0])))
+        except (ValueError, TypeError):
+            continue
+        meta = {headers[i]: row[i] for i in range(min(len(headers), len(row)))}
+        result[car] = {
+            "origem":      str(meta.get("Local de Origem", "") or "").strip(),
+            "destino":     str(meta.get("Local de Destino", "") or "").strip(),
+            "intermedios": str(meta.get("Locais Intermédios", "") or "").strip(),
+        }
+    return result
+
+
+def _parse_format_a(wb) -> list[dict]:
+    """Parse original .xlsm (Horários + Resumo + Rotas sheets)."""
+    # Build resumo lookup
+    resumo = {}
+    if "Resumo" in wb.sheetnames:
+        try:
+            resumo = _parse_resumo_sheet(wb["Resumo"])
+        except Exception as e:
+            logger.warning("Resumo sheet error: %s", e)
+
+    rotas = {}
+    if "Rotas" in wb.sheetnames:
+        try:
+            rotas = _parse_rotas_sheet(wb["Rotas"])
+        except Exception as e:
+            logger.warning("Rotas sheet error: %s", e)
+
+    routes = []
+    if "Horários" in wb.sheetnames:
+        try:
+            routes = _parse_horarios_sheet(wb["Horários"], resumo)
+        except Exception as e:
+            logger.error("Horários sheet error: %s", e)
+            raise
+
+    # Merge rotas origem/destino when not from resumo
+    for r in routes:
+        car = r["carreira"]
+        if car in rotas:
+            rt = rotas[car]
+            if not r.get("origem"):
+                r["origem"] = rt["origem"]
+            if not r.get("destino"):
+                r["destino"] = rt["destino"]
+        # Fallback to first/last stop
+        if not r.get("origem") and r["stops"]:
+            r["origem"] = r["stops"][0]["paragem"]
+        if not r.get("destino") and r["stops"]:
+            r["destino"] = r["stops"][-1]["paragem"]
+
+    return routes
+
+
+# ---------------------------------------------------------------------------
+# FORMAT B — Generated summary .xlsx (sheets: R1, R1_Exp, R2, ...)
+# ---------------------------------------------------------------------------
+
+_GEN_DETAIL_PREFIXES = ("R1", "R2", "R3")
+_GEN_SUMMARY_SHEET   = "Resumo Geral"
+
+# Column positions in generated sheets (0-indexed)
+_G = dict(
+    carreira=0, desig=1, transp=2, viatura=3, period=4,
+    npar=5, paragem=6, hcheg=7, hpart=8, tpar=9, ttran=10, km=11, tipo=12,
+)
+
+
+def _parse_format_b_sheet(ws, sheet_name: str) -> list[dict]:
+    rede = "R3" if sheet_name.startswith("R3") else ("R2" if sheet_name.startswith("R2") else "R1")
+    routes: list[dict] = []
+    current: Optional[dict] = None
+
+    for row_raw in ws.iter_rows(min_row=2, values_only=True):
+        row = list(row_raw)
+        while len(row) < 13:
+            row.append(None)
+
+        v0 = row[0]
+        # Skip header and separator rows
+        if v0 is None or str(v0).strip() in ("Carreira", ""):
+            continue
+        # Block title row: starts with '['
+        if isinstance(v0, str) and v0.strip().startswith("["):
+            if current and current.get("stops"):
+                current["stops"] = _fix_overnight(current["stops"])
+                routes.append(current)
+            current = None
+            continue
+        # All-None = separator
+        if all(v is None for v in row):
+            if current and current.get("stops"):
+                current["stops"] = _fix_overnight(current["stops"])
+                routes.append(current)
+            current = None
+            continue
+
+        try:
+            carreira = int(float(str(v0)))
+        except (ValueError, TypeError):
+            continue
+
+        if current is None or current.get("carreira") != carreira:
+            if current and current.get("stops"):
+                current["stops"] = _fix_overnight(current["stops"])
+                routes.append(current)
+            current = {
+                "carreira":      carreira,
+                "designacao":    str(row[_G["desig"]] or "").strip(),
+                "transportador": str(row[_G["transp"]] or "").strip(),
+                "veiculo":       str(row[_G["viatura"]] or "").strip(),
+                "periodicidade": str(row[_G["period"]] or "").strip(),
+                "rede":          rede,
+                "regiao":        "",
+                "origem":        "",
+                "destino":       "",
+                "stops":         [],
+            }
+
+        try:
+            npar = int(row[_G["npar"]]) if row[_G["npar"]] is not None else None
+        except (ValueError, TypeError):
+            npar = None
+
+        hpc = _time_to_minutes(row[_G["hcheg"]])
+        hpp = _time_to_minutes(row[_G["hpart"]])
+
+        def _safe_float(v):
+            try:
+                return float(v) if v is not None else None
+            except (ValueError, TypeError):
+                return None
+
+        stop = {
+            "paragem": str(row[_G["paragem"]] or "").strip(),
+            "n_par":   npar,
+            "hpc":     hpc,
+            "hpp":     hpp,
+            "tp":      _safe_float(row[_G["tpar"]]),
+            "tt":      _safe_float(row[_G["ttran"]]),
+            "km":      _safe_float(row[_G["km"]]),
+            "tipo":    str(row[_G["tipo"]] or "").strip(),
+        }
+        current["stops"].append(stop)
+
+    if current and current.get("stops"):
+        current["stops"] = _fix_overnight(current["stops"])
+        routes.append(current)
+
+    return routes
+
+
+def _parse_format_b(wb) -> list[dict]:
+    routes = []
+    for sname in wb.sheetnames:
+        if any(sname.startswith(p) for p in _GEN_DETAIL_PREFIXES) and sname != _GEN_SUMMARY_SHEET:
+            try:
+                routes.extend(_parse_format_b_sheet(wb[sname], sname))
+            except Exception as e:
+                logger.warning("Sheet %s error: %s", sname, e)
+    return routes
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
 
 def parse_network_xlsm(file) -> dict:
-    """Parse the network .xlsm/.xlsx file.
+    """Parse a network file (original .xlsm OR generated .xlsx).
 
-    Parameters
-    ----------
-    file : file-like or path
-        The uploaded network workbook.
+    Auto-detects format from sheet names.
 
     Returns
     -------
-    dict with keys:
-        'routes'      : list of route dicts
-        'stops_index' : dict {stop_name -> [carreira, ...]}
-        'summary'     : dict {carreira -> summary record}
+    dict:
+        routes      : list of route dicts
+        stops_index : {stop_name -> [carreira, ...]}
+        summary     : {carreira -> meta dict}
     """
     try:
         wb = openpyxl.load_workbook(file, read_only=True, data_only=True)
@@ -365,61 +455,51 @@ def parse_network_xlsm(file) -> dict:
         logger.error("Failed to open network file: %s", exc)
         raise
 
-    summary: dict[int, dict] = {}
-    if _SUMMARY_SHEET in wb.sheetnames:
-        try:
-            summary = _parse_summary_sheet(wb[_SUMMARY_SHEET])
-        except Exception as exc:
-            logger.warning("Could not parse summary sheet: %s", exc)
+    sheetnames = set(wb.sheetnames)
 
-    routes: list[dict] = []
-    for sheet_name in wb.sheetnames:
-        if not any(sheet_name.startswith(p) for p in _DETAIL_SHEET_PREFIXES):
-            continue
-        try:
-            ws = wb[sheet_name]
-            sheet_routes = _parse_detail_sheet(ws, sheet_name)
-            routes.extend(sheet_routes)
-        except Exception as exc:
-            logger.warning("Error parsing sheet %s: %s", sheet_name, exc)
+    # Detect format
+    is_format_a = "Horários" in sheetnames
+    is_format_b = any(s.startswith(p) for s in sheetnames for p in _GEN_DETAIL_PREFIXES) and not is_format_a
 
-    # Enrich routes from summary
-    for route in routes:
-        carreira = route["carreira"]
-        if carreira in summary:
-            rec = summary[carreira]
-            if not route.get("regiao") or route["regiao"] == "Nacional":
-                route["regiao"] = str(rec.get("Região", route["regiao"]) or route["regiao"])
-            if not route.get("designacao"):
-                route["designacao"] = str(rec.get("Designação", "") or "")
-            route["origem"] = str(rec.get("Origem", "") or "")
-            route["destino"] = str(rec.get("Destino", "") or "")
-            # Rede from summary overrides sheet inference when available
-            rede_sum = str(rec.get("Rede", "") or "").strip()
-            if rede_sum in ("R1", "R2", "R3"):
-                route["rede"] = rede_sum
-        else:
-            route.setdefault("origem", route["stops"][0]["paragem"] if route["stops"] else "")
-            route.setdefault("destino", route["stops"][-1]["paragem"] if route["stops"] else "")
+    if is_format_a:
+        logger.info("Detected format A (original .xlsm — Horários sheet)")
+        routes = _parse_format_a(wb)
+    elif is_format_b:
+        logger.info("Detected format B (generated .xlsx — R1/R2/R3 sheets)")
+        routes = _parse_format_b(wb)
+    else:
+        raise ValueError(
+            f"Formato de ficheiro não reconhecido. "
+            f"Sheets encontradas: {sorted(sheetnames)}"
+        )
 
-    # Tag reverse-logistics routes
+    # Tag reverse logistics
     for route in routes:
         route["is_reverse_logistics"] = detect_reverse_logistics(route)
-        route["reverse_leg_from"] = find_reverse_leg_from(route) if route["is_reverse_logistics"] else None
+        route["reverse_leg_from"] = (
+            find_reverse_leg_from(route) if route["is_reverse_logistics"] else None
+        )
 
-    # Build stops index: paragem name → list of carreira codes
+    # Build stops index
     stops_index: dict[str, list[int]] = {}
     for route in routes:
-        carreira = route["carreira"]
-        for stop in route["stops"]:
-            name = stop["paragem"]
+        for stop in route.get("stops", []):
+            name = stop.get("paragem", "")
             if name:
-                stops_index.setdefault(name, []).append(carreira)
+                stops_index.setdefault(name, []).append(route["carreira"])
+
+    # Build summary dict
+    summary = {r["carreira"]: r for r in routes}
+
+    logger.info(
+        "Parsed %d routes, %d stops, %d unique stop names",
+        len(routes), sum(len(r["stops"]) for r in routes), len(stops_index),
+    )
 
     return {
-        "routes": routes,
+        "routes":      routes,
         "stops_index": stops_index,
-        "summary": summary,
+        "summary":     summary,
     }
 
 
@@ -427,44 +507,23 @@ def parse_network_xlsm(file) -> dict:
 # Execution file parser
 # ---------------------------------------------------------------------------
 
-# Column name normalization map (Portuguese execution file headers → internal names)
 _EXEC_COL_MAP = {
-    "Carreira": "carreira",
-    "Trajeto": "trajeto",
-    "Ponto": "ponto",
-    "Ligação": "ligacao",
-    "Viatura": "viatura",
-    "Ocupação": "ocupacao",
-    "Rede": "rede",
-    "C/P": "cp",
-    "Dia": "dia",
-    "Previsto": "previsto",
-    "Real": "real",
-    "Atraso": "atraso",
-    "Anomalia": "anomalia",
-    "Causa": "causa",
-    "Responsabilidade": "responsabilidade",
-    "Designação paragem": "designacao_paragem",
-    "TP/RE": "tp_re",
-    "Ordem": "ordem",
-    "Real APL": "real_apl",
-    "Real Telemetria": "real_telemetria",
-    "Obs.": "obs",
+    "Carreira": "carreira", "Trajeto": "trajeto", "Ponto": "ponto",
+    "Ligação": "ligacao", "Viatura": "viatura", "Ocupação": "ocupacao",
+    "Rede": "rede", "C/P": "cp", "Dia": "dia", "Previsto": "previsto",
+    "Real": "real", "Atraso": "atraso", "Anomalia": "anomalia",
+    "Causa": "causa", "Responsabilidade": "responsabilidade",
+    "Designação paragem": "designacao_paragem", "TP/RE": "tp_re",
+    "Ordem": "ordem", "Real APL": "real_apl",
+    "Real Telemetria": "real_telemetria", "Obs.": "obs",
     "Nº Portal": "n_portal",
-    # Alternate spellings / case variations
+    # alternate spellings
     "Designação Paragem": "designacao_paragem",
-    "Ligacao": "ligacao",
-    "Ocupacao": "ocupacao",
+    "Ligacao": "ligacao", "Ocupacao": "ocupacao",
 }
 
 
 def _parse_delay_value(val) -> Optional[float]:
-    """Parse a delay value to float minutes.
-
-    Handles:
-    - numeric (int/float)
-    - strings like "30", "30 minutos", "30 min", "+30", "-5"
-    """
     if val is None:
         return None
     if isinstance(val, (int, float)):
@@ -472,7 +531,6 @@ def _parse_delay_value(val) -> Optional[float]:
     s = str(val).strip()
     if not s:
         return None
-    # Remove non-numeric suffixes
     m = re.match(r"^([+-]?\d+(?:\.\d+)?)", s)
     if m:
         return float(m.group(1))
@@ -480,21 +538,13 @@ def _parse_delay_value(val) -> Optional[float]:
 
 
 def parse_execution_file(file) -> pd.DataFrame:
-    """Parse an execution file (.xls, .xlsx, or .csv).
-
-    Returns a normalised DataFrame with internal column names.
-    """
-    # Determine format from filename if possible
+    """Parse execution file (.xls, .xlsx, or .csv) into a normalised DataFrame."""
     fname = getattr(file, "name", "")
-    if isinstance(fname, str):
-        fname_lower = fname.lower()
-    else:
-        fname_lower = ""
+    fname_lower = str(fname).lower() if fname else ""
 
     df: Optional[pd.DataFrame] = None
     errors = []
 
-    # Try xls first (old Excel format)
     if fname_lower.endswith(".xls") and not fname_lower.endswith(".xlsx"):
         try:
             df = pd.read_excel(file, engine="xlrd")
@@ -502,7 +552,6 @@ def parse_execution_file(file) -> pd.DataFrame:
             errors.append(f"xlrd: {exc}")
 
     if df is None:
-        # Try openpyxl engine for xlsx
         try:
             if hasattr(file, "seek"):
                 file.seek(0)
@@ -519,25 +568,30 @@ def parse_execution_file(file) -> pd.DataFrame:
             errors.append(f"csv: {exc}")
 
     if df is None:
-        raise ValueError(f"Could not parse execution file. Errors: {'; '.join(errors)}")
+        raise ValueError(f"Não foi possível abrir o ficheiro. Erros: {'; '.join(errors)}")
 
-    # Rename columns to internal names
-    rename_map = {}
-    for orig_col in df.columns:
-        key = str(orig_col).strip()
-        if key in _EXEC_COL_MAP:
-            rename_map[orig_col] = _EXEC_COL_MAP[key]
+    # Rename columns
+    rename_map = {c: _EXEC_COL_MAP[str(c).strip()]
+                  for c in df.columns if str(c).strip() in _EXEC_COL_MAP}
     df = df.rename(columns=rename_map)
 
-    # Ensure required columns exist (add NaN columns if missing)
-    for internal in _EXEC_COL_MAP.values():
+    # Ensure all internal columns exist
+    for internal in set(_EXEC_COL_MAP.values()):
         if internal not in df.columns:
             df[internal] = None
 
-    # Parse numeric delay column
     df["atraso_min"] = df["atraso"].apply(_parse_delay_value)
+    df["carreira_str"] = df["carreira"].apply(
+        lambda x: str(int(x)) if pd.notna(x) and x != "" else ""
+    )
 
-    # Normalise carreira to string for display
-    df["carreira_str"] = df["carreira"].apply(lambda x: str(int(x)) if pd.notna(x) else "")
+    # Flag individual trips as reverse logistics via Obs. column
+    def _trip_is_reverse(obs_val) -> bool:
+        if obs_val is None:
+            return False
+        obs_lower = str(obs_val).lower()
+        return any(k in obs_lower for k in _REVERSE_KEYWORDS)
+
+    df["trip_is_reverse"] = df["obs"].apply(_trip_is_reverse)
 
     return df
