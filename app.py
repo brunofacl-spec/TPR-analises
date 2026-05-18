@@ -503,6 +503,39 @@ def _regiao_label(tp_re: str) -> str:
     return prefix or "Desconhecido"
 
 
+_TURNOS = {
+    "00h–08h": (0, 8),
+    "08h–16h": (8, 16),
+    "16h–24h": (16, 24),
+}
+
+def _previsto_hour(val) -> Optional[int]:
+    """Extract hour from a Previsto value (string 'HH:MM:SS', time, or datetime)."""
+    import datetime as _dt
+    if val is None or (isinstance(val, float) and math.isnan(val)):
+        return None
+    if isinstance(val, _dt.time):
+        return val.hour
+    if isinstance(val, _dt.datetime):
+        return val.hour
+    s = str(val).strip()
+    if not s:
+        return None
+    try:
+        return int(s.split(":")[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def _turno_label(hour: Optional[int]) -> str:
+    if hour is None:
+        return "Desconhecido"
+    for label, (h0, h1) in _TURNOS.items():
+        if h0 <= hour < h1:
+            return label
+    return "Desconhecido"
+
+
 def _compute_metrics(exec_df: pd.DataFrame) -> dict:
     """Compute OTD, OTA, OTP and summary stats from the execution DataFrame."""
     df = exec_df.copy()
@@ -512,6 +545,8 @@ def _compute_metrics(exec_df: pd.DataFrame) -> dict:
     df["_tp_re"] = df["tp_re"].fillna("")
     df["_rede"] = df["rede"].fillna("")
     df["_dia"] = df["dia"].astype(str)
+    df["_hora"] = df["previsto"].apply(_previsto_hour)
+    df["_turno"] = df["_hora"].apply(_turno_label)
     df["_regiao"] = df["_tp_re"].apply(_regiao_label)
 
     p = df[df["_cp"] == "P"]
@@ -587,6 +622,34 @@ def _compute_metrics(exec_df: pd.DataFrame) -> dict:
     labels = ["≤15 min", "16–30 min", "31–60 min", ">60 min"]
     dist = pd.cut(delay_vals, bins=bins, labels=labels, right=True).value_counts().sort_index()
 
+    # Per-shift metrics (OTD / OTA / OTP per turno)
+    turno_metrics = {}
+    for turno_label in list(_TURNOS.keys()) + ["Desconhecido"]:
+        pv = p_valid[p_valid["_turno"] == turno_label]
+        cv = c_valid[c_valid["_turno"] == turno_label]
+        if len(pv) == 0 and len(cv) == 0:
+            continue
+        pd_ = (pv["_anomalia"] == "ATRASO PARTIDA").sum()
+        cd_ = (cv["_anomalia"] == "ATRASO CHEGADA").sum()
+        _otd = round((len(pv) - pd_) / len(pv) * 100, 1) if len(pv) else None
+        _ota = round((len(cv) - cd_) / len(cv) * 100, 1) if len(cv) else None
+        # OTP: first departure per carreira within this shift
+        pv_ord = pv.copy()
+        pv_ord["_ordem"] = pd.to_numeric(pv_ord["ordem"], errors="coerce")
+        if pv_ord["_ordem"].notna().any():
+            fd = pv_ord.loc[pv_ord.groupby("carreira_str")["_ordem"].idxmin()]
+        else:
+            fd = pv_ord.drop_duplicates("carreira_str")
+        fd_d = (fd["_anomalia"] == "ATRASO PARTIDA").sum()
+        _otp = round((len(fd) - fd_d) / len(fd) * 100, 1) if len(fd) else None
+        turno_metrics[turno_label] = dict(
+            otd=_otd, ota=_ota, otp=_otp,
+            n_p=len(pv), n_delayed_p=int(pd_),
+            n_c=len(cv), n_delayed_c=int(cd_),
+            mean_delay=round(pv[pv["_anomalia"]=="ATRASO PARTIDA"]["_atraso"].mean(), 1)
+                if pd_ > 0 else 0.0,
+        )
+
     return dict(
         otd=otd, ota=ota, otp=otp,
         n_cancelled=n_cancelled, pct_cancelled=pct_cancelled,
@@ -596,6 +659,7 @@ def _compute_metrics(exec_df: pd.DataFrame) -> dict:
         max_delay=max_delay, n_gt30=n_gt30, n_gt60=n_gt60,
         otd_rede=otd_rede, otd_reg=otd_reg, otd_day=otd_day,
         top_delayed=top_delayed, delay_dist=dist,
+        turno_metrics=turno_metrics,
         days=sorted(df["_dia"].unique()),
     )
 
@@ -635,6 +699,68 @@ def _render_metrics(m: dict):
         delta_color="inverse",
         help="Carreiras com pelo menos um evento CANCELADA",
     )
+
+    st.markdown("---")
+
+    # ── Per-shift breakdown ───────────────────────────────────────────────────
+    st.subheader("🕐 Métricas por Turno")
+    turno_data = m.get("turno_metrics", {})
+    if turno_data:
+        cols = st.columns(len(turno_data))
+        for col, (turno, tm) in zip(cols, turno_data.items()):
+            otd_v = tm["otd"]
+            ota_v = tm["ota"]
+            otp_v = tm["otp"]
+            col.markdown(f"**{turno}**")
+            col.metric(
+                f"{_color(otd_v)} OTD",
+                f"{otd_v:.1f}%" if otd_v is not None else "—",
+                f"{tm['n_delayed_p']} atrasos / {tm['n_p']} partidas",
+                delta_color="off",
+            )
+            col.metric(
+                f"{_color(ota_v)} OTA",
+                f"{ota_v:.1f}%" if ota_v is not None else "—",
+                f"{tm['n_delayed_c']} atrasos / {tm['n_c']} chegadas",
+                delta_color="off",
+            )
+            col.metric(
+                f"{_color(otp_v)} OTP",
+                f"{otp_v:.1f}%" if otp_v is not None else "—",
+                delta_color="off",
+            )
+            if tm["mean_delay"] > 0:
+                col.caption(f"Média atraso partida: **{tm['mean_delay']:.1f} min**")
+
+        # Bar chart: OTD per shift side-by-side with OTA and OTP
+        turnos_order = [t for t in _TURNOS if t in turno_data]
+        fig_t = go.Figure()
+        for metric_key, metric_name, color in [
+            ("otd", "OTD", "#2196F3"),
+            ("ota", "OTA", "#4CAF50"),
+            ("otp", "OTP", "#FF9800"),
+        ]:
+            vals = [turno_data[t].get(metric_key) for t in turnos_order]
+            fig_t.add_trace(go.Bar(
+                name=metric_name,
+                x=turnos_order,
+                y=vals,
+                marker_color=color,
+                text=[f"{v:.1f}%" if v is not None else "—" for v in vals],
+                textposition="outside",
+            ))
+        fig_t.add_hline(y=95, line_dash="dot", line_color="#4CAF50",
+                        annotation_text="Meta 95%", annotation_position="right")
+        fig_t.add_hline(y=90, line_dash="dot", line_color="#FFC107",
+                        annotation_text="90%", annotation_position="right")
+        fig_t.update_layout(
+            barmode="group",
+            yaxis=dict(range=[75, 101], title="%"),
+            height=320,
+            margin=dict(l=20, r=60, t=20, b=20),
+            legend=dict(orientation="h", y=1.1),
+        )
+        st.plotly_chart(fig_t, use_container_width=True)
 
     st.markdown("---")
 
