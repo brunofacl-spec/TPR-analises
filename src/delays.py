@@ -109,19 +109,16 @@ def calculate_cascade(
                 window = edge.get("window", 90)
                 shared_stop = edge.get("stop", "")
 
-                # Inherited delay: original delay minus the connection slack at this stop.
-                # If the delay eats into the connection window, the downstream route
-                # may still be affected (but with reduced inherited delay).
-                inherited = max(0.0, delay - window)
+                # Inherited delay: how much of the original delay exceeds the
+                # connection window at this stop.
+                # If delay <= window the downstream route has enough slack — no impact.
+                inherited = delay - window
 
-                # Even if inherited == 0 we still record 1 min to indicate risk.
-                # Only truly skip if the delay is far below the window.
-                if delay <= 0:
+                if inherited <= 0:
                     continue
 
-                # Record the impact (keep maximum inherited delay across paths)
                 key = (successor, src_carreira)
-                effective_delay = inherited if inherited > 0 else min(delay, window / 2.0)
+                effective_delay = inherited
 
                 if key not in impacts or impacts[key]["atraso_herdado"] < effective_delay:
                     node_data = graph.nodes.get(successor, {})

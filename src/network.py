@@ -17,17 +17,22 @@ import networkx as nx
 logger = logging.getLogger(__name__)
 
 
-def _get_stop_time(stop: dict) -> Optional[int]:
-    """Return the most relevant time for a stop (departure preferred, else arrival)."""
-    return stop.get("hpp") if stop.get("hpp") is not None else stop.get("hpc")
+def _get_arrival_time(stop: dict) -> Optional[int]:
+    """Arrival time at a stop — when cargo becomes available for transfer."""
+    return stop.get("hpc")
+
+
+def _get_departure_time(stop: dict) -> Optional[int]:
+    """Departure time from a stop — when the vehicle leaves with loaded cargo."""
+    hpp = stop.get("hpp")
+    if hpp is not None:
+        return hpp
+    # Origin stop has no arrival; use departure only
+    return stop.get("hpc")
 
 
 def build_stop_index(routes: list[dict]) -> dict[str, list[tuple[int, dict]]]:
-    """Build an index: stop_name → list of (carreira, stop_dict).
-
-    This allows O(stops × avg_routes_per_stop) dependency detection
-    instead of the naive O(routes²) approach.
-    """
+    """Build an index: stop_name → list of (carreira, stop_dict)."""
     index: dict[str, list[tuple[int, dict]]] = {}
     for route in routes:
         carreira = route["carreira"]
@@ -88,86 +93,98 @@ def build_dependency_graph(
         if len(entries) < 2:
             continue
 
-        # Filter entries that have a valid time
-        timed_entries = [
-            (carreira, stop, _get_stop_time(stop))
-            for carreira, stop in entries
-            if _get_stop_time(stop) is not None
-        ]
+        # Build two sub-indexes per stop:
+        #   arrivals : routes that arrive here  (hpc is the cargo-available time)
+        #   departures: routes that depart here (hpp is the load-deadline time)
+        # A dependency A→B exists when A arrives and B departs within the window:
+        #   0 < B.hpp - A.hpc <= connection_window_min
+        arrivals: list[tuple[int, dict, int]] = []    # (carreira, stop, hpc)
+        departures: list[tuple[int, dict, int]] = []  # (carreira, stop, hpp)
 
-        if len(timed_entries) < 2:
+        for carreira, stop in entries:
+            arr = _get_arrival_time(stop)
+            dep = _get_departure_time(stop)
+            if arr is not None:
+                arrivals.append((carreira, stop, arr))
+            if dep is not None:
+                departures.append((carreira, stop, dep))
+
+        if not arrivals or not departures:
             continue
 
-        # Sort by time
-        timed_entries.sort(key=lambda x: x[2])
+        arrivals.sort(key=lambda x: x[2])
+        departures.sort(key=lambda x: x[2])
 
-        # Compare all pairs – use sliding window to keep it efficient
-        for i, (car_a, stop_a, t_a) in enumerate(timed_entries):
+        for car_a, stop_a, t_arr_a in arrivals:
             route_a = routes_by_id.get(car_a, {})
 
-            # Skip: route A is a reverse-logistics route — it creates no cargo dependency
+            # Skip: route A is a reverse-logistics route — no cargo dependency
             if route_a.get("is_reverse_logistics", False):
                 continue
 
-            # Skip: the connection stop is the FINAL stop of route A (returning, not loading)
             stops_a = route_a.get("stops", [])
+
+            # Skip: this is the FIRST stop of route A (origin, not an intermediate hub)
+            # The first stop has no meaningful arrival cargo to transfer.
             if stops_a:
-                last_stop_a = (stops_a[-1].get("paragem") or "").strip()
-                if last_stop_a and last_stop_a == stop_name:
+                first_stop_a = (stops_a[0].get("paragem") or "").strip()
+                if first_stop_a and first_stop_a == stop_name:
                     continue
 
-            # Check for partial reverse leg: if stop index is beyond the turnaround point
+            # Skip: partial reverse leg (stop is after the turnaround point)
             rev_from = route_a.get("reverse_leg_from")
             if rev_from is not None:
-                # Find index of stop_name in route A's stop list
                 stop_idx_in_a = next(
-                    (idx for idx, s in enumerate(stops_a) if (s.get("paragem") or "").strip() == stop_name),
+                    (idx for idx, s in enumerate(stops_a)
+                     if (s.get("paragem") or "").strip() == stop_name),
                     None,
                 )
                 if stop_idx_in_a is not None and stop_idx_in_a >= rev_from:
-                    continue  # This stop is on the return leg
-
-            for j in range(i + 1, len(timed_entries)):
-                car_b, stop_b, t_b = timed_entries[j]
-                delta = t_b - t_a
-                if delta <= 0:
                     continue
-                if delta > connection_window_min:
-                    # All subsequent entries will be even further away
-                    break
+
+            for car_b, stop_b, t_dep_b in departures:
                 if car_a == car_b:
                     continue
 
-                # Detect potentially-reverse edges (flagged but not skipped)
+                # B must depart AFTER A arrives (cargo transfer window)
+                delta = t_dep_b - t_arr_a
+                if delta <= 0:
+                    continue
+                if delta > connection_window_min:
+                    break  # departures are sorted, no point continuing
+
+                # Skip: B's first stop is not a connection (B is just starting its trip)
                 route_b = routes_by_id.get(car_b, {})
+                stops_b = route_b.get("stops", [])
+                if stops_b:
+                    first_stop_b = (stops_b[0].get("paragem") or "").strip()
+                    if first_stop_b and first_stop_b == stop_name:
+                        # B originates here — no incoming cargo from A to inherit
+                        continue
+
                 name_a = (route_a.get("designacao") or "").upper()
                 obs_a  = (route_a.get("obs") or "").lower()
                 is_potentially_reverse = (
-                    "RIB" in name_a
-                    or name_a.endswith("RB")
-                    or "RB " in name_a
-                    or "empty" in obs_a
-                    or "vazi" in obs_a
+                    "RIB" in name_a or name_a.endswith("RB") or "RB " in name_a
+                    or "empty" in obs_a or "vazi" in obs_a
                 )
 
-                # Edge A → B (A feeds B)
-                # If edge already exists, keep the one with smallest window
+                # Edge A → B: keep the tightest (smallest window) connection
                 if graph.has_edge(car_a, car_b):
                     if graph[car_a][car_b]["window"] > delta:
                         graph[car_a][car_b].update(
                             stop=stop_name,
-                            time_a=t_a,
-                            time_b=t_b,
+                            time_a=t_arr_a,
+                            time_b=t_dep_b,
                             window=delta,
                             is_potentially_reverse=is_potentially_reverse,
                         )
                 else:
                     graph.add_edge(
-                        car_a,
-                        car_b,
+                        car_a, car_b,
                         stop=stop_name,
-                        time_a=t_a,
-                        time_b=t_b,
+                        time_a=t_arr_a,
+                        time_b=t_dep_b,
                         window=delta,
                         is_potentially_reverse=is_potentially_reverse,
                     )
