@@ -16,6 +16,87 @@ import openpyxl
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Reverse logistics detection
+# ---------------------------------------------------------------------------
+
+_REVERSE_KEYWORDS = [
+    "vazi",          # covers: vazio, vazia, vazias, contentores vazios, paletes vazias
+    "retorno",
+    "inversa",       # covers: logistica inversa, logística inversa
+    "empty",
+    "paletes v",
+    "contentores v",
+]
+
+_REVERSE_NAME_TOKENS = ["rib", "rb"]   # checked as whole word / suffix in route name
+
+
+def detect_reverse_logistics(route: dict) -> bool:
+    """Return True when the route is a reverse-logistics (empty return) leg.
+
+    Detection criteria (any one sufficient):
+    1. Route name (designacao) or observation (obs) contain a reverse keyword.
+    2. Route name contains 'RIB' or ends with 'RB' as a token.
+    3. Last stop has the same stop-code / name as the first stop (round-trip).
+    """
+    name = (route.get("designacao") or "").lower()
+    obs  = (route.get("obs") or "").lower()
+
+    # Keyword match in name or obs
+    if any(k in name or k in obs for k in _REVERSE_KEYWORDS):
+        return True
+
+    # Token match for RIB / RB in name
+    for token in _REVERSE_NAME_TOKENS:
+        # Match as whole word boundaries using simple split check
+        if token in name.split() or name.endswith(f"-{token}") or name.endswith(f" {token}"):
+            return True
+
+    # Round-trip: last stop == first stop (by paragem name)
+    stops = route.get("stops", [])
+    if len(stops) >= 2:
+        first_name = (stops[0].get("paragem") or "").strip().lower()
+        last_name  = (stops[-1].get("paragem") or "").strip().lower()
+        if first_name and first_name == last_name:
+            return True
+
+    return False
+
+
+def find_reverse_leg_from(route: dict) -> Optional[int]:
+    """Return the index of the stop where the return leg begins, or None.
+
+    For a round-trip route the return point is the stop with the highest km
+    (turnaround point) — heuristically the middle stop for simple out-and-back
+    routes.  Returns None when the route is not a round-trip.
+    """
+    stops = route.get("stops", [])
+    if len(stops) < 2:
+        return None
+
+    first_name = (stops[0].get("paragem") or "").strip().lower()
+    last_name  = (stops[-1].get("paragem") or "").strip().lower()
+    if not (first_name and first_name == last_name):
+        return None
+
+    # Find the stop with maximum accumulated km (turnaround)
+    max_km = -1
+    max_idx = len(stops) // 2  # fallback: midpoint
+    for i, s in enumerate(stops):
+        km = s.get("km")
+        if km is not None:
+            try:
+                km_f = float(km)
+                if km_f > max_km:
+                    max_km = km_f
+                    max_idx = i
+            except (ValueError, TypeError):
+                pass
+
+    return max_idx if max_idx > 0 else None
+
+
+# ---------------------------------------------------------------------------
 # Time helpers
 # ---------------------------------------------------------------------------
 
@@ -320,6 +401,11 @@ def parse_network_xlsm(file) -> dict:
         else:
             route.setdefault("origem", route["stops"][0]["paragem"] if route["stops"] else "")
             route.setdefault("destino", route["stops"][-1]["paragem"] if route["stops"] else "")
+
+    # Tag reverse-logistics routes
+    for route in routes:
+        route["is_reverse_logistics"] = detect_reverse_logistics(route)
+        route["reverse_leg_from"] = find_reverse_leg_from(route) if route["is_reverse_logistics"] else None
 
     # Build stops index: paragem name → list of carreira codes
     stops_index: dict[str, list[int]] = {}

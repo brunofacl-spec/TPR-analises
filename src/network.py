@@ -75,6 +75,8 @@ def build_dependency_graph(
             veiculo=route.get("veiculo", ""),
             origem=route.get("origem", ""),
             destino=route.get("destino", ""),
+            is_reverse_logistics=route.get("is_reverse_logistics", False),
+            reverse_leg_from=route.get("reverse_leg_from"),
         )
 
     # Build stop → [(carreira, stop_dict)] index
@@ -101,6 +103,30 @@ def build_dependency_graph(
 
         # Compare all pairs – use sliding window to keep it efficient
         for i, (car_a, stop_a, t_a) in enumerate(timed_entries):
+            route_a = routes_by_id.get(car_a, {})
+
+            # Skip: route A is a reverse-logistics route — it creates no cargo dependency
+            if route_a.get("is_reverse_logistics", False):
+                continue
+
+            # Skip: the connection stop is the FINAL stop of route A (returning, not loading)
+            stops_a = route_a.get("stops", [])
+            if stops_a:
+                last_stop_a = (stops_a[-1].get("paragem") or "").strip()
+                if last_stop_a and last_stop_a == stop_name:
+                    continue
+
+            # Check for partial reverse leg: if stop index is beyond the turnaround point
+            rev_from = route_a.get("reverse_leg_from")
+            if rev_from is not None:
+                # Find index of stop_name in route A's stop list
+                stop_idx_in_a = next(
+                    (idx for idx, s in enumerate(stops_a) if (s.get("paragem") or "").strip() == stop_name),
+                    None,
+                )
+                if stop_idx_in_a is not None and stop_idx_in_a >= rev_from:
+                    continue  # This stop is on the return leg
+
             for j in range(i + 1, len(timed_entries)):
                 car_b, stop_b, t_b = timed_entries[j]
                 delta = t_b - t_a
@@ -112,6 +138,18 @@ def build_dependency_graph(
                 if car_a == car_b:
                     continue
 
+                # Detect potentially-reverse edges (flagged but not skipped)
+                route_b = routes_by_id.get(car_b, {})
+                name_a = (route_a.get("designacao") or "").upper()
+                obs_a  = (route_a.get("obs") or "").lower()
+                is_potentially_reverse = (
+                    "RIB" in name_a
+                    or name_a.endswith("RB")
+                    or "RB " in name_a
+                    or "empty" in obs_a
+                    or "vazi" in obs_a
+                )
+
                 # Edge A → B (A feeds B)
                 # If edge already exists, keep the one with smallest window
                 if graph.has_edge(car_a, car_b):
@@ -121,6 +159,7 @@ def build_dependency_graph(
                             time_a=t_a,
                             time_b=t_b,
                             window=delta,
+                            is_potentially_reverse=is_potentially_reverse,
                         )
                 else:
                     graph.add_edge(
@@ -130,6 +169,7 @@ def build_dependency_graph(
                         time_a=t_a,
                         time_b=t_b,
                         window=delta,
+                        is_potentially_reverse=is_potentially_reverse,
                     )
 
     logger.info(

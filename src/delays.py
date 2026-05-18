@@ -23,6 +23,7 @@ def calculate_cascade(
     graph: nx.DiGraph,
     routes_dict: dict[int, dict],
     max_depth: int = 8,
+    include_reverse_logistics: bool = False,
 ) -> pd.DataFrame:
     """Propagate delays from initially-delayed routes through the dependency graph.
 
@@ -40,6 +41,11 @@ def calculate_cascade(
         Used to look up designacao / rede / regiao for display.
     max_depth : int
         Maximum propagation depth.
+    include_reverse_logistics : bool
+        When False (default), delays originating from reverse-logistics routes
+        (is_reverse_logistics=True in the graph node or routes_dict) are NOT
+        propagated to downstream routes.  Individual trips flagged as reverse
+        logistics via Obs notes are also excluded when False.
 
     Returns
     -------
@@ -75,6 +81,19 @@ def calculate_cascade(
             continue
         if src_delay <= 0:
             continue
+
+        # Reverse-logistics filter: skip propagation when disabled
+        if not include_reverse_logistics:
+            # Check graph node attribute first, then routes_dict, then trip-level obs flag
+            node_data = graph.nodes.get(src_carreira, {})
+            rdict = routes_dict.get(src_carreira, {})
+            is_rev = (
+                node_data.get("is_reverse_logistics", False)
+                or rdict.get("is_reverse_logistics", False)
+                or src.get("is_reverse_logistics", False)
+            )
+            if is_rev:
+                continue
 
         # BFS – queue entries: (node, delay_at_node, depth, stop_enlace)
         queue: list[tuple[int, float, int, str]] = [(src_carreira, src_delay, 0, src_stop)]
@@ -181,4 +200,24 @@ def get_initial_delays(exec_df: pd.DataFrame, anomaly_filter: Optional[str] = No
         .rename(columns={"carreira_int": "carreira"})
     )
 
-    return agg.to_dict("records")
+    records = agg.to_dict("records")
+
+    # Flag individual trips as reverse logistics based on Obs column
+    # Group obs per carreira to check trip-level notes
+    obs_by_carreira: dict[int, list[str]] = {}
+    for _, row in delayed_df.iterrows():
+        car = int(row["carreira_int"])
+        obs_val = str(row.get("obs") or "").lower()
+        obs_by_carreira.setdefault(car, []).append(obs_val)
+
+    _rev_keywords = ["vazi", "retorno", "inversa", "empty", "paletes v", "contentores v"]
+    for rec in records:
+        car = rec["carreira"]
+        obs_list = obs_by_carreira.get(car, [])
+        is_rev = any(
+            any(kw in obs for kw in _rev_keywords)
+            for obs in obs_list
+        )
+        rec["is_reverse_logistics"] = is_rev
+
+    return records

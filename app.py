@@ -108,6 +108,13 @@ def render_sidebar():
     if routes and (connection_window != prev_window or sul_only != prev_sul):
         _rebuild_graph(routes, connection_window, sul_only)
 
+    include_reverse = st.sidebar.toggle(
+        "Incluir logística inversa no impacto",
+        value=_get_state("include_reverse_logistics", False),
+        help="Quando desactivado (padrão), atrasos em carreiras de logística inversa (retornos vazios) NÃO se propagam para carreiras a jusante.",
+    )
+    _set_state("include_reverse_logistics", include_reverse)
+
     st.sidebar.markdown("---")
     st.sidebar.caption("TPR Análise de Transportes v1.0")
 
@@ -467,6 +474,13 @@ def tab_impacto_atrasos():
     df_init_display["rede"] = df_init_display["carreira"].map(
         lambda c: routes_dict.get(c, {}).get("rede", "")
     )
+    # Reverse-logistics badge (combines route-level and trip-level detection)
+    def _rev_badge(row):
+        route_rev = routes_dict.get(row["carreira"], {}).get("is_reverse_logistics", False)
+        trip_rev  = row.get("is_reverse_logistics", False)
+        return "↩️ Logística Inversa" if (route_rev or trip_rev) else ""
+
+    df_init_display["Tipo"] = df_init_display.apply(_rev_badge, axis=1)
 
     st.dataframe(
         df_init_display.rename(columns={
@@ -477,8 +491,9 @@ def tab_impacto_atrasos():
             "delay_minutes": "Atraso (min)",
             "stop": "Paragem",
             "causa": "Causa",
+            "Tipo": "Tipo",
         })[[
-            "⚠️", "Carreira", "Designação", "Rede", "Atraso (min)", "Paragem", "Causa"
+            "⚠️", "Carreira", "Designação", "Rede", "Atraso (min)", "Paragem", "Causa", "Tipo"
         ]],
         hide_index=True,
         use_container_width=True,
@@ -493,8 +508,12 @@ def tab_impacto_atrasos():
         st.warning("Grafo de dependências não disponível.")
         return
 
+    include_reverse = _get_state("include_reverse_logistics", False)
     with st.spinner("A calcular cascata de atrasos…"):
-        cascade_df = calculate_cascade(initial_delays, graph, routes_dict)
+        cascade_df = calculate_cascade(
+            initial_delays, graph, routes_dict,
+            include_reverse_logistics=include_reverse,
+        )
 
     if cascade_df.empty:
         st.info("Nenhum atraso em cascata detectado.")
@@ -508,6 +527,11 @@ def tab_impacto_atrasos():
         lambda c: routes_dict.get(c, {}).get("designacao", str(c))
     )
     cascade_df["origem_desig"] = orig_design
+
+    # Reverse-logistics badge for each affected route
+    cascade_df["Tipo"] = cascade_df["carreira"].map(
+        lambda c: "↩️ Logística Inversa" if routes_dict.get(c, {}).get("is_reverse_logistics", False) else ""
+    )
 
     # Color filter
     severity_filter = st.multiselect(
@@ -531,7 +555,7 @@ def tab_impacto_atrasos():
         filtered_cascade[[
             "⚠️", "carreira", "designacao", "rede", "regiao",
             "stop_enlace", "atraso_herdado", "profundidade",
-            "origem_atraso", "origem_desig", "causa_origem",
+            "origem_atraso", "origem_desig", "causa_origem", "Tipo",
         ]].rename(columns={
             "⚠️": "⚠️",
             "carreira": "Carreira Afectada",
@@ -544,6 +568,7 @@ def tab_impacto_atrasos():
             "origem_atraso": "Origem (Carreira)",
             "origem_desig": "Origem (Nome)",
             "causa_origem": "Causa Origem",
+            "Tipo": "Tipo",
         }),
         hide_index=True,
         use_container_width=True,
@@ -709,6 +734,12 @@ def tab_pesquisa_carreira():
 
     st.markdown(f"**Designação:** {selected_route.get('designacao', '—')}")
     st.markdown(f"**Periodicidade:** {selected_route.get('periodicidade', '—')} | **Veículo:** {selected_route.get('veiculo', '—')}")
+
+    # Route type badge
+    if selected_route.get("is_reverse_logistics", False):
+        st.markdown("**Tipo:** :orange[↩️ Logística Inversa]")
+    else:
+        st.markdown("**Tipo:** :green[📦 Carga]")
 
     # ── Stop chain table ─────────────────────────────────────────────────────
     st.subheader("Cadeia de paragens")
