@@ -459,14 +459,14 @@ def _build_map_graph(
             showlegend=True,
         ))
 
-    # Centre the map on Portugal
+    # Península Ibérica centrada em Portugal
     fig.update_layout(
         mapbox=dict(
             style="open-street-map",
-            center=dict(lat=39.5, lon=-8.0),
-            zoom=5.5,
+            center=dict(lat=39.8, lon=-6.5),
+            zoom=5.0,
         ),
-        height=680,
+        height=720,
         margin=dict(l=0, r=0, t=30, b=0),
         legend=dict(
             bgcolor="rgba(255,255,255,0.85)",
@@ -475,7 +475,7 @@ def _build_map_graph(
             x=0.01, y=0.99,
             xanchor="left", yanchor="top",
         ),
-        title="Rede de Transportes — Paragens georreferenciadas",
+        title="Rede de Transportes — Península Ibérica",
     )
     return fig
 
