@@ -616,9 +616,16 @@ def parse_execution_file(file) -> pd.DataFrame:
             df[internal] = None
 
     df["atraso_min"] = df["atraso"].apply(_parse_delay_value)
-    df["carreira_str"] = df["carreira"].apply(
-        lambda x: str(int(x)) if pd.notna(x) and x != "" else ""
-    )
+
+    def _to_carreira_str(x) -> str:
+        if not pd.notna(x) or x == "":
+            return ""
+        try:
+            return str(int(float(str(x).strip())))
+        except (ValueError, TypeError):
+            return str(x).strip()
+
+    df["carreira_str"] = df["carreira"].apply(_to_carreira_str)
 
     # Flag individual trips as reverse logistics via Obs. column
     def _trip_is_reverse(obs_val) -> bool:
