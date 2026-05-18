@@ -444,6 +444,33 @@ def _parse_format_b(wb) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Locais sheet — stop coordinates
+# ---------------------------------------------------------------------------
+
+def parse_locais_sheet(wb) -> dict[str, tuple[float, float]]:
+    """Parse 'Locais' sheet → {stop_name: (lat, lon)}."""
+    coords: dict[str, tuple[float, float]] = {}
+    if "Locais" not in wb.sheetnames:
+        return coords
+    first = True
+    for row in wb["Locais"].iter_rows(values_only=True):
+        if first:
+            first = False
+            continue
+        if not row or row[0] is None:
+            continue
+        name = str(row[0]).strip()
+        try:
+            lat = float(row[2])
+            lon = float(row[3])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if name and -90 <= lat <= 90 and -180 <= lon <= 180:
+            coords[name] = (lat, lon)
+    return coords
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -526,6 +553,17 @@ def parse_network_xlsm(file) -> dict:
     # Build summary dict
     summary = {r["carreira"]: r for r in routes}
 
+    # Load stop coordinates from Locais sheet (format A only)
+    coordinates: dict[str, tuple[float, float]] = {}
+    if is_format_a:
+        try:
+            coordinates = parse_locais_sheet(wb)
+            matched = sum(1 for s in stops_index if s in coordinates)
+            logger.info("Locais: %d coords loaded, %d/%d stops matched",
+                        len(coordinates), matched, len(stops_index))
+        except Exception as e:
+            logger.warning("Locais sheet error: %s", e)
+
     logger.info(
         "Parsed %d routes, %d stops, %d unique stop names",
         len(routes), sum(len(r["stops"]) for r in routes), len(stops_index),
@@ -535,6 +573,7 @@ def parse_network_xlsm(file) -> dict:
         "routes":      routes,
         "stops_index": stops_index,
         "summary":     summary,
+        "coordinates": coordinates,
     }
 
 

@@ -175,6 +175,7 @@ def tab_rede_semanal():
                 _set_state("routes", routes)
                 _set_state("stops_index", data["stops_index"])
                 _set_state("summary", data.get("summary", {}))
+                _set_state("coordinates", data.get("coordinates", {}))
                 # Build graph with current sidebar settings
                 window = _get_state("connection_window", 90)
                 sul_only = _get_state("sul_only", False)
@@ -257,21 +258,15 @@ def tab_rede_semanal():
 
     st.markdown("---")
 
-    # ── Network graph ───────────────────────────────────────────────────────
-    st.subheader("Grafo de Paragens")
-    st.caption("Nós = paragens, arestas = carreiras, cor = tipo de rede (R1=azul, R2=verde, R3=laranja)")
+    # ── Map graph ────────────────────────────────────────────────────────────
+    st.subheader("Mapa da Rede de Transportes")
+    st.caption("Paragens georreferenciadas com ligações por tipo de rede (R1=azul, R2=verde, R3=laranja)")
 
-    max_routes_graph = st.slider(
-        "Máximo de carreiras a mostrar no grafo",
-        min_value=10,
-        max_value=min(300, len(graph_routes)),
-        value=min(80, len(graph_routes)),
-        step=10,
-        key="graph_route_limit",
-    )
+    coordinates = _get_state("coordinates", {})
+    graph = _get_state("graph")
 
-    with st.spinner("A calcular layout do grafo…"):
-        fig_net = _build_network_graph(graph_routes[:max_routes_graph])
+    with st.spinner("A gerar mapa…"):
+        fig_net = _build_map_graph(graph_routes, coordinates, graph)
     st.plotly_chart(fig_net, use_container_width=True)
 
     # ── Full route table ─────────────────────────────────────────────────────
@@ -360,90 +355,127 @@ def _build_sankey(routes: list[dict]) -> go.Figure:
     return fig
 
 
-def _build_network_graph(routes: list[dict]) -> go.Figure:
-    """Build a Plotly scatter network graph of stops connected by routes."""
+def _build_map_graph(
+    routes: list[dict],
+    coordinates: dict[str, tuple[float, float]],
+    graph=None,
+) -> go.Figure:
+    """Build a Plotly Scattermapbox with stops on the Portugal map.
+
+    Edges = route segments between consecutive stops (coloured by rede).
+    Nodes = stops sized by number of connections in the dependency graph.
+    """
+    from collections import Counter, defaultdict
+
+    # Compute stop degree from dependency graph (how many connections each stop has)
+    stop_degree: Counter = Counter()
+    if graph is not None:
+        for u, v, d in graph.edges(data=True):
+            stop_degree[d.get("stop", "")] += 1
+
+    # Collect route segments per rede type (only between stops with coordinates)
+    edge_lats: dict[str, list] = defaultdict(list)
+    edge_lons: dict[str, list] = defaultdict(list)
+
     # Collect unique stops
-    stops: dict[str, dict] = {}
-    edges_data: list[tuple[str, str, str]] = []  # (stop_a, stop_b, rede)
+    stop_info: dict[str, dict] = {}
 
     for r in routes:
         stop_list = r.get("stops", [])
-        rede = r.get("rede", "")
+        rede = r.get("rede", "").split()[0] if r.get("rede") else ""  # R1/R2/R3
+        rede_key = rede if rede in REDE_COLORS else ""
+
         for i, s in enumerate(stop_list):
             name = s.get("paragem", "")
-            if name and name not in stops:
-                stops[name] = {"name": name, "rede": rede}
+            if not name:
+                continue
+            if name not in stop_info and name in coordinates:
+                lat, lon = coordinates[name]
+                stop_info[name] = {
+                    "lat": lat, "lon": lon,
+                    "rede": rede_key,
+                    "carreiras": [],
+                }
+            if name in stop_info:
+                stop_info[name]["carreiras"].append(r.get("carreira"))
+
+            # Draw edge from previous stop
             if i > 0:
-                prev_name = stop_list[i - 1].get("paragem", "")
-                if prev_name and name:
-                    edges_data.append((prev_name, name, rede))
-
-    if not stops:
-        return go.Figure()
-
-    # Build a small networkx graph for layout
-    G = nx.Graph()
-    for name in stops:
-        G.add_node(name)
-    for a, b, _ in edges_data:
-        G.add_edge(a, b)
-
-    try:
-        pos = nx.spring_layout(G, seed=42, k=1.5 / math.sqrt(len(G.nodes)))
-    except Exception:
-        pos = {n: (i % 30, i // 30) for i, n in enumerate(G.nodes)}
-
-    # Build edge traces (one per rede color)
-    edge_traces: dict[str, dict] = {}
-    for a, b, rede in edges_data:
-        if a not in pos or b not in pos:
-            continue
-        color = REDE_COLORS.get(rede, "#9E9E9E")
-        if rede not in edge_traces:
-            edge_traces[rede] = {"x": [], "y": [], "color": color, "rede": rede}
-        ax, ay = pos[a]
-        bx, by = pos[b]
-        edge_traces[rede]["x"] += [ax, bx, None]
-        edge_traces[rede]["y"] += [ay, by, None]
+                prev = stop_list[i - 1].get("paragem", "")
+                if prev in coordinates and name in coordinates:
+                    plat, plon = coordinates[prev]
+                    clat, clon = coordinates[name]
+                    edge_lats[rede_key] += [plat, clat, None]
+                    edge_lons[rede_key] += [plon, clon, None]
 
     fig = go.Figure()
 
-    for rede, et in edge_traces.items():
-        fig.add_trace(go.Scatter(
-            x=et["x"], y=et["y"],
+    # Edge traces (one per rede type, thin semi-transparent lines)
+    rede_labels = {"R1": "R1 (Principal)", "R2": "R2 (Secundária)",
+                   "R3": "R3 (Terciária)", "": "Outro"}
+    for rede_key, color in REDE_COLORS.items():
+        if rede_key not in edge_lats:
+            continue
+        rgba = _hex_to_rgba(color, 0.25)
+        fig.add_trace(go.Scattermapbox(
+            lat=edge_lats[rede_key],
+            lon=edge_lons[rede_key],
             mode="lines",
-            line=dict(color=et["color"], width=0.8),
-            name=f"Rede {rede}",
+            line=dict(width=1, color=rgba),
+            name=rede_labels.get(rede_key, rede_key),
             hoverinfo="none",
             showlegend=True,
         ))
 
-    # Node trace
-    node_x = [pos[n][0] for n in stops if n in pos]
-    node_y = [pos[n][1] for n in stops if n in pos]
-    node_text = list(stops.keys())
-    node_colors = [REDE_COLORS.get(stops[n]["rede"], "#9E9E9E") for n in stops if n in pos]
+    # Node trace — size proportional to dependency degree
+    if stop_info:
+        lats = [stop_info[n]["lat"] for n in stop_info]
+        lons = [stop_info[n]["lon"] for n in stop_info]
+        names = list(stop_info.keys())
+        colors = [REDE_COLORS.get(stop_info[n]["rede"], "#9E9E9E") for n in names]
+        degrees = [stop_degree.get(n, 0) for n in names]
+        max_deg = max(degrees) if degrees else 1
+        sizes = [6 + 18 * (d / max(max_deg, 1)) for d in degrees]
+        n_routes = [len(set(stop_info[n]["carreiras"])) for n in names]
+        hover = [
+            f"<b>{n}</b><br>Carreiras: {nr}<br>Ligações (dependências): {d}"
+            for n, nr, d in zip(names, n_routes, degrees)
+        ]
 
-    fig.add_trace(go.Scatter(
-        x=node_x, y=node_y,
-        mode="markers+text",
-        marker=dict(size=6, color=node_colors, line=dict(width=0.5, color="#fff")),
-        text=node_text,
-        textposition="top center",
-        textfont=dict(size=7),
-        name="Paragens",
-        hovertemplate="<b>%{text}</b><extra></extra>",
-    ))
+        fig.add_trace(go.Scattermapbox(
+            lat=lats,
+            lon=lons,
+            mode="markers",
+            marker=dict(
+                size=sizes,
+                color=colors,
+                opacity=0.85,
+                sizemode="diameter",
+            ),
+            text=names,
+            hovertemplate="%{customdata}<extra></extra>",
+            customdata=hover,
+            name="Paragens",
+            showlegend=True,
+        ))
 
+    # Centre the map on Portugal
     fig.update_layout(
-        showlegend=True,
-        hovermode="closest",
-        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-        height=600,
-        margin=dict(l=10, r=10, t=30, b=10),
-        title="Grafo de paragens",
-        paper_bgcolor="#FAFAFA",
+        mapbox=dict(
+            style="open-street-map",
+            center=dict(lat=39.5, lon=-8.0),
+            zoom=5.5,
+        ),
+        height=680,
+        margin=dict(l=0, r=0, t=30, b=0),
+        legend=dict(
+            bgcolor="rgba(255,255,255,0.85)",
+            bordercolor="#ccc",
+            borderwidth=1,
+            x=0.01, y=0.99,
+            xanchor="left", yanchor="top",
+        ),
+        title="Rede de Transportes — Paragens georreferenciadas",
     )
     return fig
 
