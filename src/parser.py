@@ -282,12 +282,18 @@ def _parse_rotas_sheet(ws) -> dict:
 
 
 def _parse_format_a(wb) -> list[dict]:
-    """Parse original .xlsm (Horários + Resumo + Rotas sheets)."""
+    """Parse original .xlsm using the literal sheet name 'Horários'."""
+    return _parse_format_a_named(wb, "Horários")
+
+
+def _parse_format_a_named(wb, horarios_sheet_name: str) -> list[dict]:
+    """Parse original .xlsm with an explicit Horários sheet name."""
     # Build resumo lookup
     resumo = {}
     if "Resumo" in wb.sheetnames:
         try:
             resumo = _parse_resumo_sheet(wb["Resumo"])
+            logger.info("Resumo: %d entries", len(resumo))
         except Exception as e:
             logger.warning("Resumo sheet error: %s", e)
 
@@ -295,16 +301,20 @@ def _parse_format_a(wb) -> list[dict]:
     if "Rotas" in wb.sheetnames:
         try:
             rotas = _parse_rotas_sheet(wb["Rotas"])
+            logger.info("Rotas: %d entries", len(rotas))
         except Exception as e:
             logger.warning("Rotas sheet error: %s", e)
 
     routes = []
-    if "Horários" in wb.sheetnames:
+    if horarios_sheet_name and horarios_sheet_name in wb.sheetnames:
         try:
-            routes = _parse_horarios_sheet(wb["Horários"], resumo)
+            routes = _parse_horarios_sheet(wb[horarios_sheet_name], resumo)
+            logger.info("Horários (%r): %d routes parsed", horarios_sheet_name, len(routes))
         except Exception as e:
-            logger.error("Horários sheet error: %s", e)
+            logger.error("Horários sheet error: %s", e, exc_info=True)
             raise
+    else:
+        logger.error("Sheet %r not found in workbook. Available: %s", horarios_sheet_name, wb.sheetnames)
 
     # Merge rotas origem/destino when not from resumo
     for r in routes:
@@ -449,23 +459,48 @@ def parse_network_xlsm(file) -> dict:
         stops_index : {stop_name -> [carreira, ...]}
         summary     : {carreira -> meta dict}
     """
+    # Always read to bytes first — avoids stream-position issues with
+    # Streamlit UploadedFile and ensures openpyxl gets a seekable buffer.
     try:
-        wb = openpyxl.load_workbook(file, read_only=True, data_only=True)
+        if hasattr(file, "read"):
+            raw = file.read()
+        else:
+            with open(file, "rb") as fh:
+                raw = fh.read()
+        wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
     except Exception as exc:
         logger.error("Failed to open network file: %s", exc)
         raise
 
     sheetnames = set(wb.sheetnames)
+    logger.info("FILE OPENED — sheets: %s", sorted(sheetnames))
 
-    # Detect format
-    is_format_a = "Horários" in sheetnames
-    is_format_b = any(s.startswith(p) for s in sheetnames for p in _GEN_DETAIL_PREFIXES) and not is_format_a
+    # Detect format — check for 'Horários' with and without accent variants
+    horarios_name = next(
+        (s for s in wb.sheetnames if s.lower().startswith("hor") and "rio" in s.lower()),
+        None,
+    )
+    is_format_a = horarios_name is not None
+    is_format_b = (
+        any(s.startswith(p) for s in sheetnames for p in _GEN_DETAIL_PREFIXES)
+        and not is_format_a
+    )
+
+    logger.info(
+        "Format detection: is_format_a=%s (sheet=%r), is_format_b=%s",
+        is_format_a, horarios_name, is_format_b,
+    )
 
     if is_format_a:
-        logger.info("Detected format A (original .xlsm — Horários sheet)")
-        routes = _parse_format_a(wb)
+        # Patch wb so _parse_format_a finds the sheet by its actual name
+        _orig_horarios = "Horários"
+        if horarios_name != _orig_horarios and horarios_name is not None:
+            logger.warning(
+                "Sheet name differs from expected: %r vs %r — using %r",
+                horarios_name, _orig_horarios, horarios_name,
+            )
+        routes = _parse_format_a_named(wb, horarios_name)
     elif is_format_b:
-        logger.info("Detected format B (generated .xlsx — R1/R2/R3 sheets)")
         routes = _parse_format_b(wb)
     else:
         raise ValueError(
