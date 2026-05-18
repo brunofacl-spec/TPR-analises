@@ -650,6 +650,43 @@ def _compute_metrics(exec_df: pd.DataFrame) -> dict:
                 if pd_ > 0 else 0.0,
         )
 
+    # Cause analysis — departure delays only
+    causa_col = "causa" if "causa" in df.columns else None
+    resp_col  = "responsabilidade" if "responsabilidade" in df.columns else None
+    ligacao_col = "ligacao" if "ligacao" in df.columns else None
+
+    causa_summary = []
+    if causa_col:
+        for causa, grp in p_delayed.groupby(p_delayed[causa_col].fillna("SEM CAUSA").str.strip().str.upper()):
+            top_enlaces = []
+            if ligacao_col:
+                top_enlaces = (
+                    grp[ligacao_col].fillna("").str.strip()
+                    .value_counts().head(5)
+                    .reset_index()
+                    .rename(columns={"index": "ligacao", ligacao_col: "ligacao", "count": "n"})
+                    .values.tolist()
+                )
+            top_resp = []
+            if resp_col:
+                top_resp = (
+                    grp[resp_col].fillna("").str.strip()
+                    .value_counts().head(3)
+                    .reset_index()
+                    .rename(columns={"index": "resp", resp_col: "resp", "count": "n"})
+                    .values.tolist()
+                )
+            causa_summary.append({
+                "causa":      causa,
+                "n":          len(grp),
+                "pct":        round(len(grp) / len(p_delayed) * 100, 1),
+                "mean_delay": round(grp["_atraso"].mean(), 1),
+                "max_delay":  int(grp["_atraso"].max()),
+                "top_enlaces": top_enlaces,
+                "top_resp":   top_resp,
+            })
+        causa_summary.sort(key=lambda x: -x["n"])
+
     return dict(
         otd=otd, ota=ota, otp=otp,
         n_cancelled=n_cancelled, pct_cancelled=pct_cancelled,
@@ -660,6 +697,7 @@ def _compute_metrics(exec_df: pd.DataFrame) -> dict:
         otd_rede=otd_rede, otd_reg=otd_reg, otd_day=otd_day,
         top_delayed=top_delayed, delay_dist=dist,
         turno_metrics=turno_metrics,
+        causa_summary=causa_summary,
         days=sorted(df["_dia"].unique()),
     )
 
@@ -836,6 +874,67 @@ def _render_metrics(m: dict):
     })
     st.dataframe(top[["⚠️", "Carreira", "Ligação", "Atraso máx (min)"]],
                  hide_index=True, use_container_width=True)
+
+    st.markdown("---")
+
+    # ── Cause summary ────────────────────────────────────────────────────────
+    causa_list = m.get("causa_summary", [])
+    if causa_list:
+        st.subheader("📋 Resumo das Causas de Atraso na Partida")
+
+        # Narrative text
+        days_str = " e ".join(m["days"]) if m["days"] else "o período"
+        total_d   = m["n_delayed_p"]
+        top3      = causa_list[:3]
+
+        lines = [
+            f"**Período analisado:** {days_str}  |  "
+            f"**Total de atrasos de partida:** {total_d} em {m['n_valid_p']} partidas válidas  |  "
+            f"**OTD:** {m['otd']:.1f}%\n",
+        ]
+        lines.append("**Principais causas:**\n")
+        for i, c in enumerate(top3, 1):
+            enlaces = ", ".join(
+                f"*{e[0]}*" for e in c["top_enlaces"][:3] if e[0]
+            ) or "—"
+            resp = ", ".join(
+                f"{r[0]} ({r[1]})" for r in c["top_resp"][:2] if r[0]
+            ) or "—"
+            lines.append(
+                f"{i}. **{c['causa']}** — {c['n']} ocorrências ({c['pct']:.0f}%)  "
+                f"| Média: {c['mean_delay']:.0f} min | Máx: {c['max_delay']} min  \n"
+                f"   Principais enlaces: {enlaces}  \n"
+                f"   Responsabilidade: {resp}\n"
+            )
+        if len(causa_list) > 3:
+            rest = causa_list[3:]
+            rest_str = " · ".join(f"{c['causa']} ({c['n']})" for c in rest)
+            lines.append(f"\n**Outras causas:** {rest_str}")
+
+        st.markdown("\n".join(lines))
+
+        st.markdown("---")
+
+        # Expandable detail per cause
+        st.markdown("**Detalhe por causa:**")
+        for c in causa_list:
+            label = f"{_delay_emoji(c['max_delay'])} {c['causa']}  — {c['n']} ocorrências ({c['pct']:.0f}%)  ·  média {c['mean_delay']:.0f} min"
+            with st.expander(label):
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("**Principais enlaces afectados**")
+                    if c["top_enlaces"]:
+                        rows = [{"Ligação": e[0], "Ocorrências": e[1]} for e in c["top_enlaces"] if e[0]]
+                        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+                    else:
+                        st.caption("Sem dados de ligação")
+                with col2:
+                    st.markdown("**Responsabilidade**")
+                    if c["top_resp"]:
+                        rows = [{"Entidade": r[0], "Ocorrências": r[1]} for r in c["top_resp"] if r[0]]
+                        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+                    else:
+                        st.caption("Sem dados de responsabilidade")
 
     st.markdown("---")
 # ═══════════════════════════════════════════════════════════════════════════════
