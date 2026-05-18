@@ -160,7 +160,17 @@ def tab_rede_semanal():
     if uploaded is not None:
         with st.spinner("A processar ficheiro de rede…"):
             try:
-                data = parse_network_xlsm(uploaded)
+                import importlib, src.parser as _parser_mod
+                importlib.reload(_parser_mod)
+                from src.parser import parse_network_xlsm as _parse_fresh
+
+                # Read into fresh BytesIO to avoid any stream-position issues
+                raw_bytes = uploaded.read()
+                import io as _io
+                file_obj = _io.BytesIO(raw_bytes)
+                file_obj.name = getattr(uploaded, "name", "network.xlsm")
+
+                data = _parse_fresh(file_obj)
                 routes = data["routes"]
                 _set_state("routes", routes)
                 _set_state("stops_index", data["stops_index"])
@@ -169,7 +179,27 @@ def tab_rede_semanal():
                 window = _get_state("connection_window", 90)
                 sul_only = _get_state("sul_only", False)
                 _rebuild_graph(routes, window, sul_only)
-                st.success(f"✅ {len(routes)} carreiras carregadas com sucesso.")
+                if routes:
+                    st.success(f"✅ {len(routes)} carreiras carregadas com sucesso.")
+                else:
+                    st.error(
+                        "⚠️ 0 carreiras encontradas. O ficheiro pode estar num formato "
+                        "inesperado. Ver detalhes abaixo."
+                    )
+                    with st.expander("Diagnóstico"):
+                        import openpyxl as _opx
+                        _wb = _opx.load_workbook(_io.BytesIO(raw_bytes), read_only=True, data_only=True)
+                        st.write("**Sheets encontradas:**", _wb.sheetnames)
+                        if "Horários" in _wb.sheetnames:
+                            _ws = _wb["Horários"]
+                            sample = []
+                            for _r in _ws.iter_rows(values_only=True):
+                                sample.append(_r[:5])
+                                if len(sample) >= 10:
+                                    break
+                            st.write("**Primeiras 10 linhas da sheet Horários:**")
+                            st.write(sample)
+                        _wb.close()
             except Exception as exc:
                 st.error(f"Erro ao carregar ficheiro: {exc}")
                 logger.exception("Network file parse error")
