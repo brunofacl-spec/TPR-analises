@@ -148,63 +148,110 @@ def _rebuild_graph(routes: list[dict], window: int, sul_only: bool):
 # TAB 1 — Rede Semanal
 # ═══════════════════════════════════════════════════════════════════════════════
 
+_NETWORK_FILE_PATH = os.path.join(os.path.dirname(__file__), "data", "rede_atual.xlsm")
+_NETWORK_META_PATH = os.path.join(os.path.dirname(__file__), "data", "rede_meta.txt")
+
+
+def _load_network_from_bytes(raw_bytes: bytes, filename: str):
+    """Parse network bytes, update session state, rebuild graph."""
+    import importlib, src.parser as _parser_mod
+    importlib.reload(_parser_mod)
+    from src.parser import parse_network_xlsm as _parse_fresh
+
+    file_obj = io.BytesIO(raw_bytes)
+    file_obj.name = filename
+    data = _parse_fresh(file_obj)
+    routes = data["routes"]
+    _set_state("routes", routes)
+    _set_state("stops_index", data["stops_index"])
+    _set_state("summary", data.get("summary", {}))
+    _set_state("coordinates", data.get("coordinates", {}))
+    window  = _get_state("connection_window", 90)
+    sul_only = _get_state("sul_only", False)
+    _rebuild_graph(routes, window, sul_only)
+    return routes
+
+
+def _save_network_file(raw_bytes: bytes, filename: str):
+    """Persist network file to data/ folder."""
+    os.makedirs(os.path.dirname(_NETWORK_FILE_PATH), exist_ok=True)
+    with open(_NETWORK_FILE_PATH, "wb") as f:
+        f.write(raw_bytes)
+    import datetime as _dt
+    with open(_NETWORK_META_PATH, "w") as f:
+        f.write(f"{filename}\n{_dt.datetime.now().strftime('%Y-%m-%d %H:%M')}")
+
+
+def _read_network_meta() -> tuple[str, str]:
+    """Return (filename, saved_at) from meta file, or ('', '') if absent."""
+    try:
+        with open(_NETWORK_META_PATH) as f:
+            lines = f.read().splitlines()
+        return lines[0] if lines else "", lines[1] if len(lines) > 1 else ""
+    except FileNotFoundError:
+        return "", ""
+
+
 def tab_rede_semanal():
     st.header("📋 Rede Semanal")
 
-    uploaded = st.file_uploader(
-        "Carregar ficheiro de rede (.xlsm / .xlsx)",
-        type=["xlsm", "xlsx"],
-        key="network_uploader",
-    )
-
-    if uploaded is not None:
-        with st.spinner("A processar ficheiro de rede…"):
+    # ── Auto-load persisted file on first run ────────────────────────────────
+    if not _get_state("routes") and os.path.exists(_NETWORK_FILE_PATH):
+        fname, saved_at = _read_network_meta()
+        with st.spinner(f"A carregar rede guardada ({fname or 'rede_atual.xlsm'})…"):
             try:
-                import importlib, src.parser as _parser_mod
-                importlib.reload(_parser_mod)
-                from src.parser import parse_network_xlsm as _parse_fresh
-
-                # Read into fresh BytesIO to avoid any stream-position issues
-                raw_bytes = uploaded.read()
-                import io as _io
-                file_obj = _io.BytesIO(raw_bytes)
-                file_obj.name = getattr(uploaded, "name", "network.xlsm")
-
-                data = _parse_fresh(file_obj)
-                routes = data["routes"]
-                _set_state("routes", routes)
-                _set_state("stops_index", data["stops_index"])
-                _set_state("summary", data.get("summary", {}))
-                _set_state("coordinates", data.get("coordinates", {}))
-                # Build graph with current sidebar settings
-                window = _get_state("connection_window", 90)
-                sul_only = _get_state("sul_only", False)
-                _rebuild_graph(routes, window, sul_only)
+                with open(_NETWORK_FILE_PATH, "rb") as f:
+                    raw = f.read()
+                routes = _load_network_from_bytes(raw, fname or "rede_atual.xlsm")
                 if routes:
-                    st.success(f"✅ {len(routes)} carreiras carregadas com sucesso.")
-                else:
-                    st.error(
-                        "⚠️ 0 carreiras encontradas. O ficheiro pode estar num formato "
-                        "inesperado. Ver detalhes abaixo."
+                    st.success(
+                        f"✅ Rede carregada automaticamente — **{fname}**"
+                        + (f" (guardada em {saved_at})" if saved_at else "")
+                        + f"  |  {len(routes)} carreiras"
                     )
-                    with st.expander("Diagnóstico"):
-                        import openpyxl as _opx
-                        _wb = _opx.load_workbook(_io.BytesIO(raw_bytes), read_only=True, data_only=True)
-                        st.write("**Sheets encontradas:**", _wb.sheetnames)
-                        if "Horários" in _wb.sheetnames:
-                            _ws = _wb["Horários"]
-                            sample = []
-                            for _r in _ws.iter_rows(values_only=True):
-                                sample.append(_r[:5])
-                                if len(sample) >= 10:
-                                    break
-                            st.write("**Primeiras 10 linhas da sheet Horários:**")
-                            st.write(sample)
-                        _wb.close()
             except Exception as exc:
-                st.error(f"Erro ao carregar ficheiro: {exc}")
-                logger.exception("Network file parse error")
-                return
+                st.warning(f"Não foi possível carregar o ficheiro guardado: {exc}")
+
+    # ── Replace file section ─────────────────────────────────────────────────
+    fname_current, saved_at = _read_network_meta()
+    has_saved = os.path.exists(_NETWORK_FILE_PATH)
+
+    if has_saved:
+        label = (
+            f"🔄 Substituir ficheiro de rede"
+            + (f" (actual: **{fname_current}**, {saved_at})" if fname_current else "")
+        )
+    else:
+        label = "📂 Carregar ficheiro de rede (.xlsm / .xlsx)"
+
+    with st.expander(label, expanded=not has_saved):
+        uploaded = st.file_uploader(
+            "Novo ficheiro de rede (.xlsm / .xlsx)",
+            type=["xlsm", "xlsx"],
+            key="network_uploader",
+        )
+        if uploaded is not None:
+            with st.spinner("A processar e guardar ficheiro de rede…"):
+                try:
+                    raw_bytes = uploaded.read()
+                    routes = _load_network_from_bytes(raw_bytes, uploaded.name)
+                    if routes:
+                        _save_network_file(raw_bytes, uploaded.name)
+                        st.success(
+                            f"✅ {len(routes)} carreiras carregadas e ficheiro guardado. "
+                            "Será usado automaticamente nas próximas sessões."
+                        )
+                    else:
+                        st.error("⚠️ 0 carreiras encontradas.")
+                        with st.expander("Diagnóstico"):
+                            import openpyxl as _opx
+                            _wb = _opx.load_workbook(io.BytesIO(raw_bytes), read_only=True, data_only=True)
+                            st.write("**Sheets:**", _wb.sheetnames)
+                            _wb.close()
+                except Exception as exc:
+                    st.error(f"Erro ao carregar ficheiro: {exc}")
+                    logger.exception("Network file parse error")
+                    return
 
     routes = _get_state("routes")
     if not routes:

@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 *.pyo
 .env
+# ficheiro de rede persistido localmente (não partilhar no repositório)
+data/rede_atual.xlsm
+data/rede_atual.xlsx
