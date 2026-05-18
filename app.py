@@ -481,7 +481,237 @@ def _build_map_graph(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — Análise de Impacto de Atrasos
+# Metrics helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_SUL_PREFIXES = {"OCS", "SCR", "SEX", "SIB", "OLX", "CO ALG", "CO EV", "CO BEN", "CO PAL"}
+
+def _regiao_label(tp_re: str) -> str:
+    prefix = str(tp_re).split("/")[0].strip().upper()
+    if prefix in _SUL_PREFIXES:
+        return "Sul"
+    if prefix.startswith("OCC") or prefix.startswith("CCR") or prefix.startswith("CEX") or prefix in {
+        "CO AV", "CO CO", "CO LR", "CO PIN", "CO TN", "CO VS"
+    }:
+        return "Centro"
+    if prefix.startswith("OCN") or prefix.startswith("NCR") or prefix.startswith("NEX") or prefix in {
+        "CO BR", "CO RIO"
+    }:
+        return "Norte"
+    if prefix in {"CO MAD", "TPM", "TPA", "CO OVD", "CO SEV"}:
+        return "Ibéria/Outro"
+    return prefix or "Desconhecido"
+
+
+def _compute_metrics(exec_df: pd.DataFrame) -> dict:
+    """Compute OTD, OTA, OTP and summary stats from the execution DataFrame."""
+    df = exec_df.copy()
+    df["_anomalia"] = df["anomalia"].fillna("").str.strip().str.upper()
+    df["_cp"] = df["cp"].fillna("").str.strip()
+    df["_atraso"] = pd.to_numeric(df["atraso_min"], errors="coerce").fillna(0)
+    df["_tp_re"] = df["tp_re"].fillna("")
+    df["_rede"] = df["rede"].fillna("")
+    df["_dia"] = df["dia"].astype(str)
+    df["_regiao"] = df["_tp_re"].apply(_regiao_label)
+
+    p = df[df["_cp"] == "P"]
+    c = df[df["_cp"] == "C"]
+
+    p_valid = p[p["_anomalia"] != "CANCELADA"]
+    c_valid = c[c["_anomalia"] != "CANCELADA"]
+
+    # OTD
+    p_delayed = p_valid[p_valid["_anomalia"] == "ATRASO PARTIDA"]
+    otd = (len(p_valid) - len(p_delayed)) / len(p_valid) * 100 if len(p_valid) else 0.0
+
+    # OTA
+    c_delayed = c_valid[c_valid["_anomalia"] == "ATRASO CHEGADA"]
+    ota = (len(c_valid) - len(c_delayed)) / len(c_valid) * 100 if len(c_valid) else 0.0
+
+    # OTP — first departure per carreira (min Ordem among P rows)
+    if "ordem" in df.columns:
+        p_ord = p_valid.copy()
+        p_ord["_ordem"] = pd.to_numeric(p_ord["ordem"], errors="coerce")
+        first_dep = p_ord.loc[p_ord.groupby("carreira_str")["_ordem"].idxmin()]
+    else:
+        first_dep = p_valid.loc[p_valid.groupby("carreira_str")["_atraso"].idxmax()]
+    fd_delayed = first_dep[first_dep["_anomalia"] == "ATRASO PARTIDA"]
+    otp = (len(first_dep) - len(fd_delayed)) / len(first_dep) * 100 if len(first_dep) else 0.0
+
+    # Cancelled routes
+    n_cancelled = df[df["_anomalia"] == "CANCELADA"]["carreira_str"].nunique()
+    pct_cancelled = n_cancelled / (df["carreira_str"].nunique()) * 100
+
+    # Delay stats (departures only)
+    delay_vals = p_delayed["_atraso"]
+    mean_delay  = delay_vals.mean() if len(delay_vals) else 0.0
+    median_delay = delay_vals.median() if len(delay_vals) else 0.0
+    max_delay   = delay_vals.max() if len(delay_vals) else 0.0
+    n_gt30 = int((delay_vals > 30).sum())
+    n_gt60 = int((delay_vals > 60).sum())
+
+    # OTD by rede
+    otd_rede = {}
+    for rede, grp in p_valid.groupby("_rede"):
+        d = (grp["_anomalia"] == "ATRASO PARTIDA").sum()
+        otd_rede[rede] = round((len(grp) - d) / len(grp) * 100, 1) if len(grp) else 0.0
+
+    # OTD by region
+    otd_reg = {}
+    for reg, grp in p_valid.groupby("_regiao"):
+        d = (grp["_anomalia"] == "ATRASO PARTIDA").sum()
+        otd_reg[reg] = {
+            "otd": round((len(grp) - d) / len(grp) * 100, 1) if len(grp) else 0.0,
+            "n_total": len(grp),
+            "n_delayed": int(d),
+        }
+
+    # OTD by day
+    otd_day = {}
+    for day, grp in p_valid.groupby("_dia"):
+        d = (grp["_anomalia"] == "ATRASO PARTIDA").sum()
+        otd_day[day] = round((len(grp) - d) / len(grp) * 100, 1) if len(grp) else 0.0
+
+    # Top delayed routes
+    top_delayed = (
+        p_delayed.groupby(["carreira_str", "ligacao"])["_atraso"]
+        .max()
+        .sort_values(ascending=False)
+        .head(15)
+        .reset_index()
+    )
+    top_delayed.columns = ["carreira", "designacao", "atraso_max"]
+
+    # Delay distribution buckets
+    bins   = [0, 15, 30, 60, float("inf")]
+    labels = ["≤15 min", "16–30 min", "31–60 min", ">60 min"]
+    dist = pd.cut(delay_vals, bins=bins, labels=labels, right=True).value_counts().sort_index()
+
+    return dict(
+        otd=otd, ota=ota, otp=otp,
+        n_cancelled=n_cancelled, pct_cancelled=pct_cancelled,
+        n_delayed_p=len(p_delayed), n_valid_p=len(p_valid),
+        n_delayed_c=len(c_delayed), n_valid_c=len(c_valid),
+        mean_delay=mean_delay, median_delay=median_delay,
+        max_delay=max_delay, n_gt30=n_gt30, n_gt60=n_gt60,
+        otd_rede=otd_rede, otd_reg=otd_reg, otd_day=otd_day,
+        top_delayed=top_delayed, delay_dist=dist,
+        days=sorted(df["_dia"].unique()),
+    )
+
+
+def _render_metrics(m: dict):
+    """Render the OTD/OTA/OTP dashboard."""
+    def _color(pct):
+        if pct >= 95:  return "🟢"
+        if pct >= 90:  return "🟡"
+        return "🔴"
+
+    # ── KPI cards ────────────────────────────────────────────────────────────
+    st.subheader("📊 KPIs de Pontualidade")
+    dias_label = " · ".join(m["days"]) if m["days"] else "—"
+    st.caption(f"Período: {dias_label}")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric(
+        f"{_color(m['otd'])} OTD — On Time Departure",
+        f"{m['otd']:.1f}%",
+        help="% de partidas sem atraso (excluindo canceladas)",
+    )
+    c2.metric(
+        f"{_color(m['ota'])} OTA — On Time Arrival",
+        f"{m['ota']:.1f}%",
+        help="% de chegadas sem atraso (excluindo canceladas)",
+    )
+    c3.metric(
+        f"{_color(m['otp'])} OTP — On Time Presentation",
+        f"{m['otp']:.1f}%",
+        help="% de carreiras com a 1.ª partida pontual (proxy de apresentação)",
+    )
+    c4.metric(
+        "🚫 Canceladas",
+        f"{m['n_cancelled']} carreiras",
+        f"{m['pct_cancelled']:.1f}% do total",
+        delta_color="inverse",
+        help="Carreiras com pelo menos um evento CANCELADA",
+    )
+
+    st.markdown("---")
+
+    # ── Delay stats + distribution ────────────────────────────────────────────
+    col_a, col_b = st.columns([1, 2])
+
+    with col_a:
+        st.subheader("Atrasos de Partida")
+        st.markdown(f"""
+| Indicador | Valor |
+|---|---|
+| Nº atrasos | **{m['n_delayed_p']}** de {m['n_valid_p']} partidas |
+| Média | **{m['mean_delay']:.1f} min** |
+| Mediana | **{m['median_delay']:.1f} min** |
+| Máximo | **{m['max_delay']:.0f} min** |
+| > 30 min | **{m['n_gt30']}** |
+| > 60 min | **{m['n_gt60']}** |
+""")
+
+    with col_b:
+        dist = m["delay_dist"]
+        if not dist.empty:
+            fig_dist = go.Figure(go.Bar(
+                x=dist.index.astype(str).tolist(),
+                y=dist.values.tolist(),
+                marker_color=["#4CAF50", "#FFC107", "#FF5722", "#D32F2F"],
+                text=dist.values.tolist(),
+                textposition="outside",
+            ))
+            fig_dist.update_layout(
+                title="Distribuição de atrasos de partida",
+                xaxis_title="Intervalo",
+                yaxis_title="Nº ocorrências",
+                height=280,
+                margin=dict(l=20, r=20, t=40, b=20),
+                showlegend=False,
+            )
+            st.plotly_chart(fig_dist, use_container_width=True)
+
+    st.markdown("---")
+
+    # ── OTD by rede + region ────────────────────────────────────────────────
+    col_r, col_g = st.columns(2)
+
+    with col_r:
+        st.subheader("OTD por Rede")
+        rede_data = [
+            {"Rede": k, "OTD (%)": v, "": _color(v)}
+            for k, v in sorted(m["otd_rede"].items())
+        ]
+        st.dataframe(pd.DataFrame(rede_data), hide_index=True, use_container_width=True)
+
+    with col_g:
+        st.subheader("OTD por Região")
+        reg_data = sorted(
+            [
+                {"Região": r, "OTD (%)": v["otd"], "Atrasos": v["n_delayed"],
+                 "Total": v["n_total"], "": _color(v["otd"])}
+                for r, v in m["otd_reg"].items()
+            ],
+            key=lambda x: x["OTD (%)"],
+        )
+        st.dataframe(pd.DataFrame(reg_data), hide_index=True, use_container_width=True)
+
+    st.markdown("---")
+
+    # ── Top delayed routes ───────────────────────────────────────────────────
+    st.subheader("🔴 Top carreiras com maior atraso de partida")
+    top = m["top_delayed"].copy()
+    top["⚠️"] = top["atraso_max"].apply(_delay_emoji)
+    top = top.rename(columns={
+        "carreira": "Carreira", "designacao": "Ligação", "atraso_max": "Atraso máx (min)"
+    })
+    st.dataframe(top[["⚠️", "Carreira", "Ligação", "Atraso máx (min)"]],
+                 hide_index=True, use_container_width=True)
+
+    st.markdown("---")
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def tab_impacto_atrasos():
@@ -516,6 +746,11 @@ def tab_impacto_atrasos():
     if exec_df is None:
         st.info("⬆️ Carregue o ficheiro de execução para análise de atrasos.")
         return
+
+    # ── OTD / OTA / OTP metrics ──────────────────────────────────────────────
+    with st.spinner("A calcular métricas…"):
+        metrics = _compute_metrics(exec_df)
+    _render_metrics(metrics)
 
     # ── Detected delays ──────────────────────────────────────────────────────
     anomaly_options = ["ATRASO PARTIDA", "ATRASO CHEGADA", ""]
