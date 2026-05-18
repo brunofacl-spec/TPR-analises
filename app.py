@@ -44,6 +44,15 @@ SUL_REGIONS = {"OCS/Sul", "OCS/Évora", "OCS/Palmela", "SEX", "SIB", "OLX",
 
 REDE_COLORS = {"R1": "#2196F3", "R2": "#4CAF50", "R3": "#FF9800", "": "#9E9E9E"}
 
+
+def _hex_to_rgba(hex_color: str, alpha: float = 0.5) -> str:
+    """Convert #RRGGBB to rgba(r,g,b,alpha) for Plotly compatibility."""
+    h = hex_color.lstrip("#")
+    if len(h) == 6:
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        return f"rgba({r},{g},{b},{alpha})"
+    return hex_color
+
 DELAY_COLOR = {
     "low":    "#FFC107",   # < 30 min  🟡
     "medium": "#FF5722",   # 30–60 min 🟠
@@ -309,7 +318,7 @@ def _build_sankey(routes: list[dict]) -> go.Figure:
             source=sources,
             target=targets,
             value=values,
-            color=[c + "88" for c in colors],
+            color=[_hex_to_rgba(c, 0.53) for c in colors],
         ),
     ))
     fig.update_layout(
@@ -633,7 +642,7 @@ def _build_cascade_sankey(
         sources.append(src_idx)
         targets.append(tgt_idx)
         values.append(max(1, delay_h))
-        link_colors.append(color + "AA")
+        link_colors.append(_hex_to_rgba(color, 0.67))
 
     if not sources:
         return go.Figure().update_layout(title="Sem dados de cascata para visualizar")
