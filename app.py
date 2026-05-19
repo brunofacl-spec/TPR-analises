@@ -1531,22 +1531,113 @@ def _fmt_min(minutes: Optional[int]) -> str:
     return f"{h:02d}:{m:02d}"
 
 
+# Weekday numbers: 0=Mon … 4=Fri, 5=Sat, 6=Sun
+_DAY_ABBR: dict[str, int] = {
+    "2a": 0, "2ª": 0, "seg": 0,
+    "3a": 1, "3ª": 1, "ter": 1,
+    "4a": 2, "4ª": 2, "qua": 2,
+    "5a": 3, "5ª": 3, "qui": 3,
+    "6a": 4, "6ª": 4, "sex": 4,
+    "sab": 5, "sáb": 5, "sab.": 5,
+    "dom": 6, "dom.": 6,
+}
+
+_DAY_NAMES = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]
+
+
+def _parse_periodicidade(s: str) -> frozenset[int]:
+    """Convert a Portuguese periodicidade string to a frozenset of weekday numbers.
+
+    Unknown / empty strings return all 7 days (conservative: never filter out).
+    """
+    if not s or s.strip() == "":
+        return frozenset(range(7))
+
+    raw = s.strip()
+    # Normalise ordinal indicators → "a", remove "feira/Feira", collapse spaces
+    norm = (
+        raw.lower()
+        .replace("ª", "a")   # feminine ordinal U+00AA
+        .replace("°", "a")   # degree sign U+00B0
+        .replace("º", "a")   # masculine ordinal U+00BA  (e.g. "6º")
+        .replace("feira", "")
+        .replace("  ", " ")
+        .strip()
+    )
+
+    def _tok_to_day(tok: str) -> Optional[int]:
+        t = tok.strip().rstrip(".")
+        return _DAY_ABBR.get(t)
+
+    # Range: "X a Y"
+    if " a " in norm:
+        left, right = norm.split(" a ", 1)
+        start = _tok_to_day(left.strip().split()[-1])
+        end   = _tok_to_day(right.strip().split()[0])
+        if start is not None and end is not None:
+            if end >= start:
+                return frozenset(range(start, end + 1))
+            # Wrap-around (e.g. "Dom a 5ª" = 6,0,1,2,3)
+            return frozenset(range(start, 7)) | frozenset(range(0, end + 1))
+
+    # Enumeration: "X e Y" or "X, Y e Z"
+    if " e " in norm or "," in norm:
+        tokens = norm.replace(",", " ").replace(" e ", " ").split()
+        days = {_tok_to_day(t) for t in tokens}
+        days.discard(None)
+        if days:
+            return frozenset(days)
+
+    # Single token (e.g. "Sáb", "Dom", "2ª Feira")
+    tokens = norm.split()
+    for tok in tokens:
+        d = _tok_to_day(tok)
+        if d is not None:
+            return frozenset({d})
+
+    return frozenset(range(7))  # fallback — don't filter
+
+
+def _dias_label(days: frozenset[int]) -> str:
+    """Human-readable day set, e.g. 'Seg–Sex' or 'Sáb · Dom'."""
+    if not days:
+        return "—"
+    sorted_days = sorted(days)
+    if sorted_days == list(range(7)):
+        return "Todos"
+    if sorted_days == list(range(5)):
+        return "Seg–Sex"
+    if sorted_days == list(range(6)):
+        return "Seg–Sáb"
+    # Compact consecutive ranges
+    parts = []
+    start = sorted_days[0]
+    prev  = sorted_days[0]
+    for d in sorted_days[1:]:
+        if d == prev + 1:
+            prev = d
+        else:
+            parts.append(_DAY_NAMES[start] if start == prev else f"{_DAY_NAMES[start]}–{_DAY_NAMES[prev]}")
+            start = prev = d
+    parts.append(_DAY_NAMES[start] if start == prev else f"{_DAY_NAMES[start]}–{_DAY_NAMES[prev]}")
+    return " · ".join(parts)
+
+
 def _build_chaining_suggestions(
     routes: list[dict],
     window_min: int = 90,
     exclude_same_route: bool = True,
 ) -> pd.DataFrame:
-    """Find pairs (A, B) where A ends at hub X and B departs from hub X
-    within window_min, suggesting the same vehicle/driver could serve both.
+    """Find pairs (A, B) where A ends at hub X and B departs from hub X within
+    window_min, on at least one common operating day.
 
-    Returns a DataFrame sorted by hub and connection window.
+    Only pairs that share ≥1 weekday are returned (prevents Sat routes being
+    chained with Mon routes, etc.).
     """
     from collections import defaultdict
 
-    # Index: hub_name → list of (route, arrival_minutes)   [route endings]
     endings: dict[str, list] = defaultdict(list)
-    # Index: hub_name → list of (route, departure_minutes) [route starts]
-    starts: dict[str, list] = defaultdict(list)
+    starts:  dict[str, list] = defaultdict(list)
 
     for r in routes:
         stops = r.get("stops", [])
@@ -1558,48 +1649,56 @@ def _build_chaining_suggestions(
 
         hub_end   = (last.get("paragem") or "").strip()
         hub_start = (first.get("paragem") or "").strip()
+        arr_end   = last.get("hpc")
+        dep_start = first.get("hpp")
 
-        arr_end  = last.get("hpc")    # when A arrives at its final stop
-        dep_start = first.get("hpp")  # when B departs from its first stop
+        days = _parse_periodicidade(r.get("periodicidade", "") or "")
 
         if hub_end and arr_end is not None:
-            endings[hub_end].append((r, int(arr_end)))
+            endings[hub_end].append((r, int(arr_end), days))
         if hub_start and dep_start is not None:
-            starts[hub_start].append((r, int(dep_start)))
+            starts[hub_start].append((r, int(dep_start), days))
 
     rows = []
     hubs = set(endings) & set(starts)
 
     for hub in sorted(hubs):
-        for route_a, t_arr in sorted(endings[hub], key=lambda x: x[1]):
-            for route_b, t_dep in sorted(starts[hub], key=lambda x: x[1]):
+        for route_a, t_arr, days_a in sorted(endings[hub], key=lambda x: x[1]):
+            for route_b, t_dep, days_b in sorted(starts[hub], key=lambda x: x[1]):
                 if exclude_same_route and route_a["carreira"] == route_b["carreira"]:
                     continue
 
-                # Compute delta, handling overnight (t_dep might be next day)
+                # Only pair routes that share at least one operating day
+                common_days = days_a & days_b
+                if not common_days:
+                    continue
+
                 delta = t_dep - t_arr
                 if delta < 0:
-                    delta += 1440  # next-day departure
+                    delta += 1440
                 if delta <= 0 or delta > window_min:
                     continue
 
                 rows.append({
-                    "hub":            hub,
-                    "carreira_a":     route_a["carreira"],
-                    "designacao_a":   route_a.get("designacao", ""),
-                    "rede_a":         route_a.get("rede", ""),
-                    "regiao_a":       route_a.get("regiao", ""),
+                    "hub":             hub,
+                    "carreira_a":      route_a["carreira"],
+                    "designacao_a":    route_a.get("designacao", ""),
+                    "rede_a":          route_a.get("rede", ""),
+                    "regiao_a":        route_a.get("regiao", ""),
                     "transportador_a": route_a.get("transportador", ""),
-                    "chegada_a":      _fmt_min(t_arr),
-                    "carreira_b":     route_b["carreira"],
-                    "designacao_b":   route_b.get("designacao", ""),
-                    "rede_b":         route_b.get("rede", ""),
-                    "regiao_b":       route_b.get("regiao", ""),
+                    "periodo_a":       route_a.get("periodicidade", ""),
+                    "chegada_a":       _fmt_min(t_arr),
+                    "carreira_b":      route_b["carreira"],
+                    "designacao_b":    route_b.get("designacao", ""),
+                    "rede_b":          route_b.get("rede", ""),
+                    "regiao_b":        route_b.get("regiao", ""),
                     "transportador_b": route_b.get("transportador", ""),
-                    "partida_b":      _fmt_min(t_dep % 1440),
-                    "janela_min":     delta,
-                    "inter_rede":     route_a.get("rede", "") != route_b.get("rede", ""),
-                    "inter_transp":   route_a.get("transportador", "") != route_b.get("transportador", ""),
+                    "periodo_b":       route_b.get("periodicidade", ""),
+                    "partida_b":       _fmt_min(t_dep % 1440),
+                    "janela_min":      delta,
+                    "dias_comuns":     _dias_label(common_days),
+                    "inter_rede":      route_a.get("rede", "") != route_b.get("rede", ""),
+                    "inter_transp":    route_a.get("transportador", "") != route_b.get("transportador", ""),
                 })
 
     return pd.DataFrame(rows)
@@ -1617,7 +1716,7 @@ def tab_sugestoes_encadeamento():
         st.warning("⚠️ Carregue primeiro o ficheiro de rede na tab **Rede Semanal**.")
         return
 
-    # ── Controls ─────────────────────────────────────────────────────────────
+    # ── Controls row 1 ───────────────────────────────────────────────────────
     col_w, col_h, col_r, col_t = st.columns(4)
     window = col_w.slider(
         "Janela de encadeamento (min)", 10, 180, 90, 5,
@@ -1632,6 +1731,24 @@ def tab_sugestoes_encadeamento():
     inter_only  = col_t.checkbox("Apenas inter-redes (R1↔R2↔R3)", value=False,
                                   key="chain_inter")
 
+    # ── Controls row 2 — transportador & day filters ─────────────────────────
+    col_ta, col_tb, col_day, col_same_t = st.columns(4)
+    all_transportadores = sorted({r.get("transportador", "") for r in routes if r.get("transportador")})
+    transp_options = ["Todos"] + all_transportadores
+    transp_a_filter = col_ta.selectbox("Transportador de A", transp_options, key="chain_transp_a")
+    transp_b_filter = col_tb.selectbox("Transportador de B", transp_options, key="chain_transp_b")
+
+    # Day-of-week filter
+    day_options = ["Todos"] + _DAY_NAMES
+    day_filter = col_day.selectbox(
+        "Dia da semana", day_options, key="chain_day",
+        help="Mostrar apenas encadeamentos que ocorrem neste dia",
+    )
+    same_transp_only = col_same_t.checkbox(
+        "Mesmo transportador (A = B)", value=False, key="chain_same_transp",
+        help="Útil para optimizar frota do mesmo operador",
+    )
+
     with st.spinner("A calcular encadeamentos…"):
         df = _build_chaining_suggestions(routes, window_min=window)
 
@@ -1639,13 +1756,37 @@ def tab_sugestoes_encadeamento():
         st.info("Sem sugestões para os parâmetros actuais.")
         return
 
-    # ── Filters ──────────────────────────────────────────────────────────────
+    # ── Apply filters ─────────────────────────────────────────────────────────
     if hub_filter:
         df = df[df["hub"].str.contains(hub_filter, case=False, na=False)]
     if rede_filter != "Todas":
         df = df[df["rede_b"].str.startswith(rede_filter)]
     if inter_only:
         df = df[df["inter_rede"]]
+    if transp_a_filter != "Todos":
+        df = df[df["transportador_a"] == transp_a_filter]
+    if transp_b_filter != "Todos":
+        df = df[df["transportador_b"] == transp_b_filter]
+    if same_transp_only:
+        df = df[df["transportador_a"] == df["transportador_b"]]
+    if day_filter != "Todos":
+        day_num = _DAY_NAMES.index(day_filter)
+        df = df[df["dias_comuns"].apply(
+            lambda label: day_filter in label or "Todos" in label or
+            # Check by re-parsing the dias_comuns label isn't ideal;
+            # filter on the raw periodicidade strings instead
+            False
+        )]
+        # Re-filter properly: check if the day number appears in both routes' periodicidades
+        # We stored periodo_a / periodo_b, so parse them again
+        df = df[
+            df["periodo_a"].apply(lambda p: day_num in _parse_periodicidade(p)) &
+            df["periodo_b"].apply(lambda p: day_num in _parse_periodicidade(p))
+        ]
+
+    if df.empty:
+        st.info("Sem sugestões para os filtros seleccionados.")
+        return
 
     st.markdown(f"**{len(df)} encadeamentos possíveis** em **{df['hub'].nunique()}** hubs")
 
@@ -1678,23 +1819,21 @@ def tab_sugestoes_encadeamento():
 
     hub_df = df[df["hub"] == selected_hub].sort_values("janela_min")
 
-    def _rede_badge(rede: str) -> str:
-        r = rede.split()[0] if rede else ""
-        colors = {"R1": "🔵", "R2": "🟢", "R3": "🟠"}
-        return f"{colors.get(r, '⚪')} {rede}"
-
     display_rows = []
     for _, row in hub_df.iterrows():
         display_rows.append({
+            "Dias": row["dias_comuns"],
             "Chegada": row["chegada_a"],
             "Ligação A": row["designacao_a"] or str(row["carreira_a"]),
             "Rede A": row["rede_a"],
+            "Transp. A": row["transportador_a"],
+            "Período A": row["periodo_a"],
             "⏱ Janela": f"{row['janela_min']} min",
             "Partida": row["partida_b"],
             "Ligação B": row["designacao_b"] or str(row["carreira_b"]),
             "Rede B": row["rede_b"],
-            "Transportador A": row["transportador_a"],
-            "Transportador B": row["transportador_b"],
+            "Transp. B": row["transportador_b"],
+            "Período B": row["periodo_b"],
         })
 
     st.dataframe(
@@ -1705,6 +1844,7 @@ def tab_sugestoes_encadeamento():
             "⏱ Janela": st.column_config.TextColumn(width="small"),
             "Chegada":  st.column_config.TextColumn(width="small"),
             "Partida":  st.column_config.TextColumn(width="small"),
+            "Dias":     st.column_config.TextColumn(width="medium"),
         },
     )
 
