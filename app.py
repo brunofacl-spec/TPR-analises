@@ -1521,16 +1521,287 @@ def _build_mini_graph(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# TAB 4 — Sugestões de Encadeamento
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _fmt_min(minutes: Optional[int]) -> str:
+    if minutes is None:
+        return "—"
+    h, m = divmod(int(minutes) % 1440, 60)
+    return f"{h:02d}:{m:02d}"
+
+
+def _build_chaining_suggestions(
+    routes: list[dict],
+    window_min: int = 90,
+    exclude_same_route: bool = True,
+) -> pd.DataFrame:
+    """Find pairs (A, B) where A ends at hub X and B departs from hub X
+    within window_min, suggesting the same vehicle/driver could serve both.
+
+    Returns a DataFrame sorted by hub and connection window.
+    """
+    from collections import defaultdict
+
+    # Index: hub_name → list of (route, arrival_minutes)   [route endings]
+    endings: dict[str, list] = defaultdict(list)
+    # Index: hub_name → list of (route, departure_minutes) [route starts]
+    starts: dict[str, list] = defaultdict(list)
+
+    for r in routes:
+        stops = r.get("stops", [])
+        if not stops:
+            continue
+
+        last  = stops[-1]
+        first = stops[0]
+
+        hub_end   = (last.get("paragem") or "").strip()
+        hub_start = (first.get("paragem") or "").strip()
+
+        arr_end  = last.get("hpc")    # when A arrives at its final stop
+        dep_start = first.get("hpp")  # when B departs from its first stop
+
+        if hub_end and arr_end is not None:
+            endings[hub_end].append((r, int(arr_end)))
+        if hub_start and dep_start is not None:
+            starts[hub_start].append((r, int(dep_start)))
+
+    rows = []
+    hubs = set(endings) & set(starts)
+
+    for hub in sorted(hubs):
+        for route_a, t_arr in sorted(endings[hub], key=lambda x: x[1]):
+            for route_b, t_dep in sorted(starts[hub], key=lambda x: x[1]):
+                if exclude_same_route and route_a["carreira"] == route_b["carreira"]:
+                    continue
+
+                # Compute delta, handling overnight (t_dep might be next day)
+                delta = t_dep - t_arr
+                if delta < 0:
+                    delta += 1440  # next-day departure
+                if delta <= 0 or delta > window_min:
+                    continue
+
+                rows.append({
+                    "hub":            hub,
+                    "carreira_a":     route_a["carreira"],
+                    "designacao_a":   route_a.get("designacao", ""),
+                    "rede_a":         route_a.get("rede", ""),
+                    "regiao_a":       route_a.get("regiao", ""),
+                    "transportador_a": route_a.get("transportador", ""),
+                    "chegada_a":      _fmt_min(t_arr),
+                    "carreira_b":     route_b["carreira"],
+                    "designacao_b":   route_b.get("designacao", ""),
+                    "rede_b":         route_b.get("rede", ""),
+                    "regiao_b":       route_b.get("regiao", ""),
+                    "transportador_b": route_b.get("transportador", ""),
+                    "partida_b":      _fmt_min(t_dep % 1440),
+                    "janela_min":     delta,
+                    "inter_rede":     route_a.get("rede", "") != route_b.get("rede", ""),
+                    "inter_transp":   route_a.get("transportador", "") != route_b.get("transportador", ""),
+                })
+
+    return pd.DataFrame(rows)
+
+
+def tab_sugestoes_encadeamento():
+    st.header("💡 Sugestões de Encadeamento")
+    st.caption(
+        "Pares de ligações onde **A termina** e **B começa** no mesmo hub dentro de uma "
+        "janela de tempo — o mesmo veículo/condutor poderia realizar ambas em sequência."
+    )
+
+    routes = _get_state("routes")
+    if not routes:
+        st.warning("⚠️ Carregue primeiro o ficheiro de rede na tab **Rede Semanal**.")
+        return
+
+    # ── Controls ─────────────────────────────────────────────────────────────
+    col_w, col_h, col_r, col_t = st.columns(4)
+    window = col_w.slider(
+        "Janela de encadeamento (min)", 10, 180, 90, 5,
+        help="Tempo máximo entre chegada de A e partida de B no mesmo hub",
+        key="chain_window",
+    )
+    hub_filter = col_h.text_input("Filtrar por hub", "", placeholder="ex: CO PAL",
+                                   key="chain_hub")
+    rede_options = ["Todas"] + sorted({r.get("rede", "").split()[0]
+                                        for r in routes if r.get("rede")})
+    rede_filter = col_r.selectbox("Rede de B", rede_options, key="chain_rede_b")
+    inter_only  = col_t.checkbox("Apenas inter-redes (R1↔R2↔R3)", value=False,
+                                  key="chain_inter")
+
+    with st.spinner("A calcular encadeamentos…"):
+        df = _build_chaining_suggestions(routes, window_min=window)
+
+    if df.empty:
+        st.info("Sem sugestões para os parâmetros actuais.")
+        return
+
+    # ── Filters ──────────────────────────────────────────────────────────────
+    if hub_filter:
+        df = df[df["hub"].str.contains(hub_filter, case=False, na=False)]
+    if rede_filter != "Todas":
+        df = df[df["rede_b"].str.startswith(rede_filter)]
+    if inter_only:
+        df = df[df["inter_rede"]]
+
+    st.markdown(f"**{len(df)} encadeamentos possíveis** em **{df['hub'].nunique()}** hubs")
+
+    # ── Summary by hub ───────────────────────────────────────────────────────
+    st.subheader("Hubs com mais oportunidades")
+    hub_summary = (
+        df.groupby("hub")
+        .agg(
+            encadeamentos=("janela_min", "count"),
+            janela_media=("janela_min", "mean"),
+            janela_min_val=("janela_min", "min"),
+        )
+        .round(1)
+        .sort_values("encadeamentos", ascending=False)
+        .reset_index()
+        .rename(columns={
+            "hub": "Hub", "encadeamentos": "Sugestões",
+            "janela_media": "Janela média (min)", "janela_min_val": "Janela mín (min)",
+        })
+    )
+    st.dataframe(hub_summary, hide_index=True, use_container_width=True)
+
+    st.markdown("---")
+
+    # ── Detail by hub ─────────────────────────────────────────────────────────
+    st.subheader("Detalhe por hub")
+
+    top_hubs = hub_summary["Hub"].tolist()
+    selected_hub = st.selectbox("Seleccionar hub", top_hubs, key="chain_hub_sel")
+
+    hub_df = df[df["hub"] == selected_hub].sort_values("janela_min")
+
+    def _rede_badge(rede: str) -> str:
+        r = rede.split()[0] if rede else ""
+        colors = {"R1": "🔵", "R2": "🟢", "R3": "🟠"}
+        return f"{colors.get(r, '⚪')} {rede}"
+
+    display_rows = []
+    for _, row in hub_df.iterrows():
+        display_rows.append({
+            "Chegada": row["chegada_a"],
+            "Ligação A": row["designacao_a"] or str(row["carreira_a"]),
+            "Rede A": row["rede_a"],
+            "⏱ Janela": f"{row['janela_min']} min",
+            "Partida": row["partida_b"],
+            "Ligação B": row["designacao_b"] or str(row["carreira_b"]),
+            "Rede B": row["rede_b"],
+            "Transportador A": row["transportador_a"],
+            "Transportador B": row["transportador_b"],
+        })
+
+    st.dataframe(
+        pd.DataFrame(display_rows),
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "⏱ Janela": st.column_config.TextColumn(width="small"),
+            "Chegada":  st.column_config.TextColumn(width="small"),
+            "Partida":  st.column_config.TextColumn(width="small"),
+        },
+    )
+
+    # ── Visual timeline per hub ───────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader(f"Diagrama de encadeamentos — {selected_hub}")
+
+    fig = go.Figure()
+    y_pos = 0
+    seen_routes = {}
+    palette = ["#2196F3", "#4CAF50", "#FF9800", "#9C27B0", "#F44336",
+               "#00BCD4", "#8BC34A", "#FF5722", "#607D8B", "#E91E63"]
+
+    for _, row in hub_df.iterrows():
+        # Route A bar (ending at hub)
+        arr_m = int(row["chegada_a"].replace(":", "")) // 100 * 60 + \
+                int(row["chegada_a"].replace(":", "")) % 100
+        dep_m = int(row["partida_b"].replace(":", "")) // 100 * 60 + \
+                int(row["partida_b"].replace(":", "")) % 100
+        if dep_m < arr_m:
+            dep_m += 1440
+
+        ca = row["carreira_a"]
+        cb = row["carreira_b"]
+        col_a = palette[hash(str(ca)) % len(palette)]
+        col_b = palette[hash(str(cb)) % len(palette)]
+
+        # Arrival marker
+        fig.add_trace(go.Scatter(
+            x=[arr_m], y=[y_pos],
+            mode="markers+text",
+            marker=dict(symbol="triangle-right", size=12, color=col_a),
+            text=[f"↘ {row['designacao_a'][:25]}"],
+            textposition="middle right",
+            textfont=dict(size=9),
+            hovertemplate=f"<b>CHEGADA</b> {row['chegada_a']}<br>{row['designacao_a']}<br>Rede: {row['rede_a']}<extra></extra>",
+            showlegend=False,
+        ))
+        # Departure marker
+        fig.add_trace(go.Scatter(
+            x=[dep_m], y=[y_pos],
+            mode="markers+text",
+            marker=dict(symbol="triangle-right", size=12, color=col_b),
+            text=[f"↗ {row['designacao_b'][:25]}"],
+            textposition="middle right",
+            textfont=dict(size=9),
+            hovertemplate=f"<b>PARTIDA</b> {row['partida_b']}<br>{row['designacao_b']}<br>Rede: {row['rede_b']}<extra></extra>",
+            showlegend=False,
+        ))
+        # Connection window bar
+        fig.add_shape(
+            type="rect",
+            x0=arr_m, x1=dep_m, y0=y_pos - 0.3, y1=y_pos + 0.3,
+            fillcolor=_hex_to_rgba("#FFC107", 0.35),
+            line=dict(color="#FFC107", width=1),
+        )
+        y_pos += 1
+
+    # X axis: convert minutes to HH:MM ticks
+    tick_vals = list(range(0, 1441, 60))
+    tick_text = [f"{h:02d}:00" for h in range(25)]
+    fig.update_layout(
+        xaxis=dict(
+            tickvals=tick_vals, ticktext=tick_text,
+            title="Hora", range=[0, 1440],
+        ),
+        yaxis=dict(showticklabels=False, title=""),
+        height=max(300, 40 + len(hub_df) * 50),
+        margin=dict(l=20, r=200, t=30, b=40),
+        showlegend=False,
+        title=f"Janelas de encadeamento em {selected_hub}",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+    # ── Export ───────────────────────────────────────────────────────────────
+    csv = df.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "⬇️ Exportar todas as sugestões (CSV)",
+        data=csv,
+        file_name="sugestoes_encadeamento.csv",
+        mime="text/csv",
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Main entry point
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
     render_sidebar()
 
-    tab1, tab2, tab3 = st.tabs([
+    tab1, tab2, tab3, tab4 = st.tabs([
         "📋 Rede Semanal",
         "⏱️ Análise de Impacto de Atrasos",
         "🔍 Pesquisa de Carreira",
+        "💡 Sugestões de Encadeamento",
     ])
 
     with tab1:
@@ -1541,6 +1812,9 @@ def main():
 
     with tab3:
         tab_pesquisa_carreira()
+
+    with tab4:
+        tab_sugestoes_encadeamento()
 
 
 if __name__ == "__main__":
