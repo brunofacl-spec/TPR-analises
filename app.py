@@ -1791,17 +1791,484 @@ def tab_sugestoes_encadeamento():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# TAB 5 — Ocupação & Grupagem
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _compute_occupancy(exec_df: pd.DataFrame) -> pd.DataFrame:
+    """Extract occupancy stats per route from execution DataFrame (P-rows only)."""
+    df = exec_df.copy()
+    p = df[df["cp"].fillna("").str.strip() == "P"].copy()
+
+    if "ocupacao" not in df.columns or p.empty:
+        return pd.DataFrame()
+
+    p["_occ"] = pd.to_numeric(p["ocupacao"], errors="coerce").fillna(0)
+    p["_occ_atr"] = (
+        pd.to_numeric(p["ocupacao_atrelado"], errors="coerce").fillna(0)
+        if "ocupacao_atrelado" in p.columns else 0.0
+    )
+
+    agg = (
+        p.groupby("carreira_str")
+        .agg(
+            occ_max=("_occ", "max"),
+            occ_mean=("_occ", "mean"),
+            occ_atr_max=("_occ_atr", "max"),
+            n_medicoes=("_occ", "count"),
+            rede=("rede", "first"),
+            tp_re=("tp_re", "first"),
+            ligacao=("ligacao", "first"),
+        )
+        .reset_index()
+    )
+    agg["occ_max"]  = agg["occ_max"].round(1)
+    agg["occ_mean"] = agg["occ_mean"].round(1)
+    agg["regiao"]   = agg["tp_re"].apply(_regiao_label)
+    return agg
+
+
+def _find_grouping_suggestions(
+    occ_df: pd.DataFrame,
+    routes: list[dict],
+    graph,
+    max_combined: float = 100.0,
+) -> pd.DataFrame:
+    """Find pairs of same-O/D routes whose combined max-occupancy fits in one vehicle.
+
+    Returns a DataFrame of candidate consolidations sorted by dependency risk
+    (safe first) then combined occupancy ascending.
+    """
+    # Build carreira_str → route dict lookup
+    routes_by_str: dict[str, dict] = {str(r["carreira"]): r for r in routes}
+
+    df = occ_df.copy()
+    df["origem"]     = df["carreira_str"].map(lambda c: routes_by_str.get(c, {}).get("origem", ""))
+    df["destino"]    = df["carreira_str"].map(lambda c: routes_by_str.get(c, {}).get("destino", ""))
+    df["veiculo"]    = df["carreira_str"].map(lambda c: routes_by_str.get(c, {}).get("veiculo", ""))
+    df["designacao"] = df["carreira_str"].map(
+        lambda c: routes_by_str.get(c, {}).get("designacao", "") or df.loc[df["carreira_str"] == c, "ligacao"].iat[0]
+        if c in routes_by_str else ""
+    )
+    df["is_reverse"] = df["carreira_str"].map(
+        lambda c: routes_by_str.get(c, {}).get("is_reverse_logistics", False)
+    )
+
+    # Keep only cargo routes with valid O-D and measured occupancy
+    valid = df[
+        (~df["is_reverse"]) &
+        (df["occ_max"] > 0) &
+        df["origem"].notna() & (df["origem"] != "") &
+        df["destino"].notna() & (df["destino"] != "")
+    ].copy()
+
+    # Dependency presence flags (any node with edges has connection risk)
+    has_deps: set[str] = set()
+    if graph is not None:
+        for n in graph.nodes:
+            if graph.degree(n) > 0:
+                has_deps.add(str(n))
+
+    rows = []
+    for (orig, dest), grp in valid.groupby(["origem", "destino"]):
+        if not orig or not dest:
+            continue
+        members = grp.to_dict("records")
+        for i in range(len(members)):
+            for j in range(i + 1, len(members)):
+                a, b = members[i], members[j]
+                combined = a["occ_max"] + b["occ_max"]
+                if combined > max_combined:
+                    continue
+
+                dep_a = a["carreira_str"] in has_deps
+                dep_b = b["carreira_str"] in has_deps
+
+                rows.append({
+                    "origem":        orig,
+                    "destino":       dest,
+                    "carreira_a":    a["carreira_str"],
+                    "designacao_a":  a.get("designacao") or a.get("ligacao", ""),
+                    "rede_a":        a["rede"],
+                    "occ_max_a":     a["occ_max"],
+                    "carreira_b":    b["carreira_str"],
+                    "designacao_b":  b.get("designacao") or b.get("ligacao", ""),
+                    "rede_b":        b["rede"],
+                    "occ_max_b":     b["occ_max"],
+                    "occ_combinada": round(combined, 1),
+                    "capacidade_livre": round(100.0 - combined, 1),
+                    "dep_risk":      dep_a or dep_b,
+                    "dep_a":         dep_a,
+                    "dep_b":         dep_b,
+                })
+
+    if not rows:
+        return pd.DataFrame()
+
+    return (
+        pd.DataFrame(rows)
+        .sort_values(["dep_risk", "occ_combinada"], ascending=[True, True])
+        .reset_index(drop=True)
+    )
+
+
+def tab_ocupacao_grupagem():
+    st.header("📦 Ocupação & Grupagem")
+    st.caption(
+        "Análise de ocupação das viaturas por carreira e sugestões de consolidação "
+        "de ligações com o mesmo O/D, sem prejuízo dos enlaces da rede."
+    )
+
+    routes = _get_state("routes")
+    graph  = _get_state("graph")
+    exec_df = _get_state("exec_df")
+
+    # ── Guard: need both files ────────────────────────────────────────────────
+    missing = []
+    if not routes:
+        missing.append("ficheiro de rede (tab **Rede Semanal**)")
+    if exec_df is None:
+        missing.append("ficheiro de execução (tab **Análise de Impacto de Atrasos**)")
+    if missing:
+        st.warning("⚠️ Carregue primeiro o " + " e o ".join(missing) + ".")
+        return
+
+    # ── Compute occupancy per route ───────────────────────────────────────────
+    with st.spinner("A calcular ocupações…"):
+        occ_df = _compute_occupancy(exec_df)
+
+    if occ_df.empty:
+        st.error("Coluna de ocupação não encontrada no ficheiro de execução.")
+        return
+
+    n_routes   = len(occ_df)
+    n_with_occ = int((occ_df["occ_max"] > 0).sum())
+    mean_occ   = occ_df[occ_df["occ_max"] > 0]["occ_max"].mean()
+    n_low      = int((occ_df["occ_max"].between(0.01, 50)).sum())
+
+    # ── KPI cards ─────────────────────────────────────────────────────────────
+    st.subheader("📊 Visão geral da ocupação")
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Carreiras analisadas", n_routes)
+    k2.metric("Com ocupação registada", n_with_occ)
+    k3.metric("Ocupação média (pico)", f"{mean_occ:.1f}%")
+    k4.metric("Carreiras < 50 % (pico)", n_low,
+              help="Candidatas a grupagem ou redimensionamento")
+
+    st.markdown("---")
+
+    # ── Distribution histogram ────────────────────────────────────────────────
+    col_hist, col_rede = st.columns([2, 1])
+
+    with col_hist:
+        st.subheader("Distribuição de ocupação máxima")
+        bins   = [0, 25, 50, 75, 90, 100]
+        labels = ["0–25 %", "26–50 %", "51–75 %", "76–90 %", "91–100 %"]
+        occ_pos = occ_df[occ_df["occ_max"] > 0]["occ_max"]
+        dist = pd.cut(occ_pos, bins=bins, labels=labels, right=True).value_counts().sort_index()
+        fig_hist = go.Figure(go.Bar(
+            x=dist.index.astype(str).tolist(),
+            y=dist.values.tolist(),
+            marker_color=["#D32F2F", "#FF9800", "#FFC107", "#4CAF50", "#1565C0"],
+            text=dist.values.tolist(),
+            textposition="outside",
+        ))
+        fig_hist.update_layout(
+            xaxis_title="Intervalo de ocupação",
+            yaxis_title="N.º carreiras",
+            height=300,
+            margin=dict(l=20, r=20, t=20, b=20),
+            showlegend=False,
+        )
+        st.plotly_chart(fig_hist, use_container_width=True)
+
+    with col_rede:
+        st.subheader("Por tipo de rede")
+        rede_agg = (
+            occ_df[occ_df["occ_max"] > 0]
+            .groupby("rede")
+            .agg(media=("occ_max", "mean"), n=("occ_max", "count"),
+                 abaixo50=("occ_max", lambda x: (x <= 50).sum()))
+            .round(1)
+            .reset_index()
+            .rename(columns={"rede": "Rede", "media": "Média (%)",
+                             "n": "Carreiras", "abaixo50": "< 50 %"})
+        )
+        st.dataframe(rede_agg, hide_index=True, use_container_width=True)
+
+        st.subheader("Por região")
+        reg_agg = (
+            occ_df[occ_df["occ_max"] > 0]
+            .groupby("regiao")
+            .agg(media=("occ_max", "mean"), n=("occ_max", "count"),
+                 abaixo50=("occ_max", lambda x: (x <= 50).sum()))
+            .round(1)
+            .reset_index()
+            .rename(columns={"regiao": "Região", "media": "Média (%)",
+                             "n": "Carreiras", "abaixo50": "< 50 %"})
+            .sort_values("Média (%)")
+        )
+        st.dataframe(reg_agg, hide_index=True, use_container_width=True)
+
+    st.markdown("---")
+
+    # ── Route occupancy table with filters ────────────────────────────────────
+    st.subheader("Detalhe por carreira")
+
+    col_f1, col_f2, col_f3 = st.columns(3)
+    rede_opts = ["Todas"] + sorted(occ_df["rede"].dropna().unique().tolist())
+    rede_sel  = col_f1.selectbox("Rede", rede_opts, key="occ_rede_filter")
+    reg_opts  = ["Todas"] + sorted(occ_df["regiao"].dropna().unique().tolist())
+    reg_sel   = col_f2.selectbox("Região", reg_opts, key="occ_reg_filter")
+    max_occ_filter = col_f3.slider(
+        "Ocupação máxima até…", 1, 100, 100, 5, key="occ_max_filter",
+        help="Mostrar apenas carreiras com occ_max ≤ este valor"
+    )
+
+    disp_df = occ_df.copy()
+    if rede_sel != "Todas":
+        disp_df = disp_df[disp_df["rede"] == rede_sel]
+    if reg_sel != "Todas":
+        disp_df = disp_df[disp_df["regiao"] == reg_sel]
+    disp_df = disp_df[disp_df["occ_max"] <= max_occ_filter]
+    disp_df = disp_df.sort_values("occ_max")
+
+    def _occ_emoji(v):
+        if v <= 25:   return "🔴"
+        if v <= 50:   return "🟠"
+        if v <= 75:   return "🟡"
+        if v <= 90:   return "🟢"
+        return "🔵"
+
+    disp_df[""] = disp_df["occ_max"].apply(_occ_emoji)
+    disp_df["Atrelado"] = disp_df["occ_atr_max"].apply(
+        lambda v: f"{v:.0f}%" if v > 0 else "—"
+    )
+
+    st.dataframe(
+        disp_df[[
+            "", "carreira_str", "ligacao", "rede", "regiao",
+            "occ_max", "occ_mean", "Atrelado", "n_medicoes",
+        ]].rename(columns={
+            "carreira_str": "Carreira", "ligacao": "Ligação",
+            "rede": "Rede", "regiao": "Região",
+            "occ_max": "Occ. Máx (%)", "occ_mean": "Occ. Média (%)",
+            "n_medicoes": "N.º Medições",
+        }),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    # CSV export
+    csv_occ = disp_df.drop(columns=[""]).to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "⬇️ Exportar ocupações (CSV)",
+        data=csv_occ,
+        file_name="ocupacoes.csv",
+        mime="text/csv",
+        key="dl_occ",
+    )
+
+    st.markdown("---")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Grouping suggestions
+    # ═══════════════════════════════════════════════════════════════════════════
+    st.subheader("🔀 Sugestões de Grupagem")
+    st.caption(
+        "Pares de carreiras com o **mesmo O/D** cuja ocupação combinada cabe numa só viatura "
+        "(≤ limiar configurável). Carreiras com dependências no grafo estão assinaladas — "
+        "verifique o impacto antes de consolidar."
+    )
+
+    col_g1, col_g2 = st.columns(2)
+    max_comb = col_g1.slider(
+        "Ocupação combinada máxima (%)", 50, 100, 100, 5,
+        key="group_max_occ",
+        help="Só sugere pares cuja soma das ocupações máximas não exceda este limiar",
+    )
+    safe_only = col_g2.checkbox(
+        "Mostrar apenas sem risco de dependências",
+        value=False,
+        key="group_safe_only",
+    )
+
+    with st.spinner("A calcular sugestões de grupagem…"):
+        grp_df = _find_grouping_suggestions(occ_df, routes, graph, max_combined=max_comb)
+
+    if grp_df.empty:
+        st.info(
+            "Sem sugestões de grupagem para os parâmetros actuais. "
+            "Experimente aumentar o limiar de ocupação combinada."
+        )
+        return
+
+    if safe_only:
+        grp_df = grp_df[~grp_df["dep_risk"]]
+
+    if grp_df.empty:
+        st.info("Sem sugestões sem risco de dependências.")
+        return
+
+    st.markdown(
+        f"**{len(grp_df)} sugestões** em "
+        f"**{grp_df[['origem', 'destino']].drop_duplicates().shape[0]}** pares O/D  ·  "
+        f"Sem risco: **{(~grp_df['dep_risk']).sum()}**  ·  "
+        f"Com dependências: **{grp_df['dep_risk'].sum()}**"
+    )
+
+    # ── Summary by O-D pair ───────────────────────────────────────────────────
+    st.subheader("Resumo por par O/D")
+    od_summary = (
+        grp_df.groupby(["origem", "destino"])
+        .agg(
+            sugestoes=("occ_combinada", "count"),
+            occ_min=("occ_combinada", "min"),
+            occ_max_comb=("occ_combinada", "max"),
+            sem_risco=("dep_risk", lambda x: (~x).sum()),
+        )
+        .reset_index()
+        .sort_values("sugestoes", ascending=False)
+        .rename(columns={
+            "origem": "Origem", "destino": "Destino",
+            "sugestoes": "Sugestões", "occ_min": "Occ. comb. mín (%)",
+            "occ_max_comb": "Occ. comb. máx (%)", "sem_risco": "Sem risco",
+        })
+    )
+    st.dataframe(od_summary, hide_index=True, use_container_width=True)
+
+    st.markdown("---")
+
+    # ── Detail table ─────────────────────────────────────────────────────────
+    st.subheader("Detalhe das sugestões")
+
+    od_pairs = (
+        grp_df[["origem", "destino"]]
+        .drop_duplicates()
+        .apply(lambda r: f"{r['origem']} → {r['destino']}", axis=1)
+        .tolist()
+    )
+    selected_od = st.selectbox("Par O/D", ["(todos)"] + od_pairs, key="grp_od_sel")
+
+    if selected_od != "(todos)":
+        orig_sel, dest_sel = selected_od.split(" → ", 1)
+        view = grp_df[(grp_df["origem"] == orig_sel) & (grp_df["destino"] == dest_sel)]
+    else:
+        view = grp_df
+
+    def _dep_badge(row):
+        parts = []
+        if row["dep_a"]:
+            parts.append(f"⚠️ {row['carreira_a']}")
+        if row["dep_b"]:
+            parts.append(f"⚠️ {row['carreira_b']}")
+        return " · ".join(parts) if parts else "✅ Seguro"
+
+    view = view.copy()
+    view["Risco"] = view.apply(_dep_badge, axis=1)
+
+    st.dataframe(
+        view[[
+            "Risco", "origem", "destino",
+            "carreira_a", "designacao_a", "rede_a", "occ_max_a",
+            "carreira_b", "designacao_b", "rede_b", "occ_max_b",
+            "occ_combinada", "capacidade_livre",
+        ]].rename(columns={
+            "origem": "Origem", "destino": "Destino",
+            "carreira_a": "Carreira A", "designacao_a": "Ligação A",
+            "rede_a": "Rede A", "occ_max_a": "Occ. A (%)",
+            "carreira_b": "Carreira B", "designacao_b": "Ligação B",
+            "rede_b": "Rede B", "occ_max_b": "Occ. B (%)",
+            "occ_combinada": "Occ. Combinada (%)", "capacidade_livre": "Cap. Livre (%)",
+        }),
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "Occ. A (%)":         st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.0f%%"),
+            "Occ. B (%)":         st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.0f%%"),
+            "Occ. Combinada (%)": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.0f%%"),
+        },
+    )
+
+    # ── Bubble chart: A vs B occupancy, coloured by risk ─────────────────────
+    st.markdown("---")
+    st.subheader("Mapa de grupagem — Occ. A vs Occ. B")
+
+    fig_bubble = go.Figure()
+    for dep_risk, grp_view in view.groupby("dep_risk"):
+        color  = "#D32F2F" if dep_risk else "#4CAF50"
+        label  = "⚠️ Com dependências" if dep_risk else "✅ Seguro"
+        symbol = "x" if dep_risk else "circle"
+        hover  = [
+            f"<b>{r['Ligação A']}</b> + <b>{r['Ligação B']}</b><br>"
+            f"O/D: {r['Origem']} → {r['Destino']}<br>"
+            f"Occ. combinada: {r['Occ. Combinada (%)']:.0f}%<br>{r['Risco']}"
+            for _, r in grp_view.rename(columns={
+                "carreira_a": "_", "designacao_a": "Ligação A",
+                "designacao_b": "Ligação B", "origem": "Origem", "destino": "Destino",
+                "occ_combinada": "Occ. Combinada (%)",
+            }).iterrows()
+        ]
+        fig_bubble.add_trace(go.Scatter(
+            x=grp_view["occ_max_a"],
+            y=grp_view["occ_max_b"],
+            mode="markers",
+            marker=dict(
+                size=10, color=color, symbol=symbol,
+                line=dict(width=1, color="#fff"),
+            ),
+            name=label,
+            text=grp_view["designacao_a"] + " + " + grp_view["designacao_b"],
+            customdata=grp_view["occ_combinada"],
+            hovertemplate="<b>%{text}</b><br>Occ. A: %{x:.0f}%  Occ. B: %{y:.0f}%<br>Combinada: %{customdata:.0f}%<extra></extra>",
+        ))
+
+    # Diagonal lines: combined = 100% and combined = max_comb%
+    diag_x = list(range(0, 101, 5))
+    fig_bubble.add_trace(go.Scatter(
+        x=diag_x, y=[100 - x for x in diag_x],
+        mode="lines", line=dict(color="#9E9E9E", dash="dot", width=1),
+        name="Occ. comb. = 100%", showlegend=True,
+    ))
+    if max_comb < 100:
+        fig_bubble.add_trace(go.Scatter(
+            x=diag_x, y=[max_comb - x for x in diag_x],
+            mode="lines", line=dict(color="#FFC107", dash="dot", width=1),
+            name=f"Limite = {max_comb}%", showlegend=True,
+        ))
+
+    fig_bubble.update_layout(
+        xaxis=dict(title="Ocupação máxima A (%)", range=[0, 105]),
+        yaxis=dict(title="Ocupação máxima B (%)", range=[0, 105]),
+        height=450,
+        margin=dict(l=20, r=20, t=20, b=40),
+        legend=dict(orientation="h", y=1.05),
+    )
+    st.plotly_chart(fig_bubble, use_container_width=True)
+
+    # ── Export ───────────────────────────────────────────────────────────────
+    csv_grp = view.drop(columns=["Risco"], errors="ignore").to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "⬇️ Exportar sugestões de grupagem (CSV)",
+        data=csv_grp,
+        file_name="sugestoes_grupagem.csv",
+        mime="text/csv",
+        key="dl_grp",
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Main entry point
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
     render_sidebar()
 
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "📋 Rede Semanal",
         "⏱️ Análise de Impacto de Atrasos",
         "🔍 Pesquisa de Carreira",
         "💡 Sugestões de Encadeamento",
+        "📦 Ocupação & Grupagem",
     ])
 
     with tab1:
@@ -1815,6 +2282,9 @@ def main():
 
     with tab4:
         tab_sugestoes_encadeamento()
+
+    with tab5:
+        tab_ocupacao_grupagem()
 
 
 if __name__ == "__main__":
