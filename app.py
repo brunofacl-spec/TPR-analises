@@ -1104,29 +1104,57 @@ def tab_impacto_atrasos():
         st.info("Nenhum atraso em cascata detectado.")
         return
 
-    st.markdown(f"**{len(cascade_df)} carreiras afectadas em cascata**")
+    # ── Cross-reference with actual execution data ───────────────────────────
+    # Build a lookup: carreira_str → max real departure delay
+    p_rows = exec_df[exec_df["cp"].fillna("").str.strip() == "P"].copy()
+    p_rows["_atraso"] = pd.to_numeric(p_rows["atraso_min"], errors="coerce").fillna(0)
+    actual_max = (
+        p_rows[p_rows["anomalia"].fillna("").str.upper().str.contains("ATRASO PARTIDA")]
+        .groupby("carreira_str")["_atraso"]
+        .max()
+    )
+    cascade_df["carreira_str"] = cascade_df["carreira"].astype(str)
+    cascade_df["atraso_real"] = cascade_df["carreira_str"].map(actual_max).fillna(0)
+    cascade_df["confirmado"] = cascade_df["atraso_real"] > 0
+
+    n_teorico   = len(cascade_df)
+    n_confirmado = int(cascade_df["confirmado"].sum())
+
+    st.markdown(
+        f"**{n_teorico} carreiras afectadas em cascata (teórico)**  ·  "
+        f"**{n_confirmado} com atraso real confirmado nas pautas**"
+    )
 
     # Add visual indicators
     cascade_df["⚠️"] = cascade_df["atraso_herdado"].apply(_delay_emoji)
-    orig_design = cascade_df["origem_atraso"].map(
+    cascade_df["origem_desig"] = cascade_df["origem_atraso"].map(
         lambda c: routes_dict.get(c, {}).get("designacao", str(c))
     )
-    cascade_df["origem_desig"] = orig_design
-
-    # Reverse-logistics badge for each affected route
     cascade_df["Tipo"] = cascade_df["carreira"].map(
         lambda c: "↩️ Logística Inversa" if routes_dict.get(c, {}).get("is_reverse_logistics", False) else ""
     )
 
-    # Color filter
-    severity_filter = st.multiselect(
-        "Filtrar por severidade",
-        options=["🟡 <30 min", "🟠 30-60 min", "🔴 >60 min"],
-        default=["🟡 <30 min", "🟠 30-60 min", "🔴 >60 min"],
-        key="severity_filter",
-    )
+    # ── Filters ──────────────────────────────────────────────────────────────
+    col_filt1, col_filt2 = st.columns([2, 1])
+    with col_filt1:
+        severity_filter = st.multiselect(
+            "Filtrar por severidade",
+            options=["🟡 <30 min", "🟠 30-60 min", "🔴 >60 min"],
+            default=["🟡 <30 min", "🟠 30-60 min", "🔴 >60 min"],
+            key="severity_filter",
+        )
+    with col_filt2:
+        only_confirmed = st.checkbox(
+            "Apenas confirmados nas pautas",
+            value=True,
+            key="cascade_confirmed_only",
+            help="Mostra só carreiras com atraso real de partida registado no ficheiro de execução. "
+                 "Remove cascatas teóricas onde a carreira cumpriu a pauta.",
+        )
 
     filtered_cascade = cascade_df.copy()
+    if only_confirmed:
+        filtered_cascade = filtered_cascade[filtered_cascade["confirmado"]]
     if "🟡 <30 min" not in severity_filter:
         filtered_cascade = filtered_cascade[filtered_cascade["atraso_herdado"] >= 30]
     if "🟠 30-60 min" not in severity_filter:
@@ -1136,10 +1164,16 @@ def tab_impacto_atrasos():
     if "🔴 >60 min" not in severity_filter:
         filtered_cascade = filtered_cascade[filtered_cascade["atraso_herdado"] < 60]
 
+    if filtered_cascade.empty:
+        st.info("Nenhum atraso confirmado com os filtros actuais.")
+        return
+
+    st.markdown(f"A mostrar **{len(filtered_cascade)}** ocorrências")
+
     st.dataframe(
         filtered_cascade[[
             "⚠️", "carreira", "designacao", "rede", "regiao",
-            "stop_enlace", "atraso_herdado", "profundidade",
+            "stop_enlace", "atraso_herdado", "atraso_real", "profundidade",
             "origem_atraso", "origem_desig", "causa_origem", "Tipo",
         ]].rename(columns={
             "⚠️": "⚠️",
@@ -1148,7 +1182,8 @@ def tab_impacto_atrasos():
             "rede": "Rede",
             "regiao": "Região",
             "stop_enlace": "Paragem de Enlace",
-            "atraso_herdado": "Atraso Herdado (min)",
+            "atraso_herdado": "Atraso Teórico (min)",
+            "atraso_real": "Atraso Real (min)",
             "profundidade": "Profundidade",
             "origem_atraso": "Origem (Carreira)",
             "origem_desig": "Origem (Nome)",
