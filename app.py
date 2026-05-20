@@ -137,7 +137,9 @@ def _filter_routes(routes: list[dict], sul_only: bool) -> list[dict]:
 def _rebuild_graph(routes: list[dict], window: int, sul_only: bool):
     filtered = _filter_routes(routes, sul_only)
     with st.spinner("A construir grafo de dependências…"):
-        graph = build_dependency_graph(filtered, window)
+        # Import fresh after any reload
+        from src.network import build_dependency_graph as _bdg
+        graph = _bdg(filtered, window)
     _set_state("graph", graph)
     _set_state("graph_routes", filtered)
     routes_dict = {r["carreira"]: r for r in filtered}
@@ -154,8 +156,13 @@ _NETWORK_META_PATH = os.path.join(os.path.dirname(__file__), "data", "rede_meta.
 
 def _load_network_from_bytes(raw_bytes: bytes, filename: str):
     """Parse network bytes, update session state, rebuild graph."""
-    import importlib, src.parser as _parser_mod
+    import importlib
+    import src.parser as _parser_mod
+    import src.network as _network_mod
+    import src.delays as _delays_mod
     importlib.reload(_parser_mod)
+    importlib.reload(_network_mod)
+    importlib.reload(_delays_mod)
     from src.parser import parse_network_xlsm as _parse_fresh
 
     file_obj = io.BytesIO(raw_bytes)
