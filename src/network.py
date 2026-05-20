@@ -23,12 +23,12 @@ def _get_arrival_time(stop: dict) -> Optional[int]:
 
 
 def _get_departure_time(stop: dict) -> Optional[int]:
-    """Departure time from a stop — when the vehicle leaves with loaded cargo."""
-    hpp = stop.get("hpp")
-    if hpp is not None:
-        return hpp
-    # Origin stop has no arrival; use departure only
-    return stop.get("hpc")
+    """Departure time from a stop — when the vehicle leaves with loaded cargo.
+
+    Returns None for destination stops (hpp absent) so they are never added
+    to the departures index.
+    """
+    return stop.get("hpp")
 
 
 def build_stop_index(routes: list[dict]) -> dict[str, list[tuple[int, dict]]]:
@@ -153,13 +153,18 @@ def build_dependency_graph(
                 if delta > connection_window_min:
                     break  # departures are sorted, no point continuing
 
-                # Skip: B's first stop is not a connection (B is just starting its trip)
+                # Skip: B's first stop — B originates here, no cargo from A to inherit
                 route_b = routes_by_id.get(car_b, {})
                 stops_b = route_b.get("stops", [])
                 if stops_b:
                     first_stop_b = (stops_b[0].get("paragem") or "").strip()
                     if first_stop_b and first_stop_b == stop_name:
-                        # B originates here — no incoming cargo from A to inherit
+                        continue
+
+                    # Skip: B's last stop — B arrives here as its final destination,
+                    # it will not depart with any cargo.
+                    last_stop_b = (stops_b[-1].get("paragem") or "").strip()
+                    if last_stop_b and last_stop_b == stop_name:
                         continue
 
                 name_a = (route_a.get("designacao") or "").upper()
