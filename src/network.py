@@ -89,6 +89,13 @@ def build_dependency_graph(
 
     # For each stop, find all pairs (A, B) where A departs before B
     # within the connection window
+    # Pre-compute last stop name per route for fast lookup
+    last_stop_of: dict[int, str] = {}
+    for route in routes:
+        stops = route.get("stops", [])
+        if stops:
+            last_stop_of[route["carreira"]] = (stops[-1].get("paragem") or "").strip()
+
     for stop_name, entries in stop_index.items():
         if len(entries) < 2:
             continue
@@ -98,6 +105,9 @@ def build_dependency_graph(
         #   departures: routes that depart here (hpp is the load-deadline time)
         # A dependency A→B exists when A arrives and B departs within the window:
         #   0 < B.hpp - A.hpc <= connection_window_min
+        #
+        # A route's LAST stop is NEVER a departure point, even if hpp is set.
+        # The hpp at the final stop is the end-of-unload time, not an onward load.
         arrivals: list[tuple[int, dict, int]] = []    # (carreira, stop, hpc)
         departures: list[tuple[int, dict, int]] = []  # (carreira, stop, hpp)
 
@@ -106,7 +116,8 @@ def build_dependency_graph(
             dep = _get_departure_time(stop)
             if arr is not None:
                 arrivals.append((carreira, stop, arr))
-            if dep is not None:
+            # Only add to departures if this is NOT the route's final stop
+            if dep is not None and last_stop_of.get(carreira) != stop_name:
                 departures.append((carreira, stop, dep))
 
         if not arrivals or not departures:
