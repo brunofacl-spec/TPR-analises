@@ -3093,35 +3093,204 @@ def tab_gerar_pauta_drivian():
         )
 
 
+def _build_exec_lookup(exec_df: pd.DataFrame) -> dict:
+    """Build lookup dict from execution data: (carreira, cp, dia_date, ordem) → row dict.
+
+    Also builds a secondary key without Ordem for cases where order differs:
+    (carreira, cp, dia_date, paragem) → row dict.
+    """
+    lookup_by_ordem: dict = {}
+    lookup_by_paragem: dict = {}
+
+    def _to_date(v):
+        if v is None:
+            return None
+        if hasattr(v, "date"):
+            return v.date()
+        if isinstance(v, str):
+            try:
+                return pd.to_datetime(v).date()
+            except Exception:
+                return None
+        return None
+
+    for _, row in exec_df.iterrows():
+        try:
+            car = int(float(str(row.get("carreira") or "")))
+        except (ValueError, TypeError):
+            continue
+        cp  = str(row.get("cp") or "").strip().upper()
+        dia = _to_date(row.get("dia"))
+        if not cp or dia is None:
+            continue
+
+        try:
+            ordem = int(float(str(row.get("ordem") or "")))
+        except (ValueError, TypeError):
+            ordem = None
+
+        paragem = str(row.get("designacao_paragem") or "").strip().lower()
+
+        row_dict = row.to_dict()
+        if ordem is not None:
+            lookup_by_ordem[(car, cp, dia, ordem)] = row_dict
+        if paragem:
+            lookup_by_paragem[(car, cp, dia, paragem)] = row_dict
+
+    return {"by_ordem": lookup_by_ordem, "by_paragem": lookup_by_paragem}
+
+
+def _fill_drivian_from_exec(drv_df: pd.DataFrame, lookup: dict) -> tuple[pd.DataFrame, dict]:
+    """Fill empty execution fields in Drivian df from exec lookup.
+
+    Returns (filled_df, stats dict).
+    """
+    import datetime as _dt
+
+    by_ordem   = lookup["by_ordem"]
+    by_paragem = lookup["by_paragem"]
+
+    # Fields to fill: (drivian_col, exec_col)
+    FILL_MAP = [
+        ("Real",             "real"),
+        ("Viatura",          "viatura"),
+        ("Ocupação",         "ocupacao"),
+        ("Atraso",           "atraso_min"),
+        ("Anomalia",         "anomalia"),
+        ("Causa",            "causa"),
+        ("Responsabilidade", "responsabilidade"),
+        ("Real APL",         "real_apl"),
+        ("Real Telemetria",  "real_telemetria"),
+        ("Obs.",             "obs"),
+    ]
+
+    df = drv_df.copy()
+    stats = {dc: {"filled": 0, "already": 0, "not_found": 0} for dc, _ in FILL_MAP}
+
+    def _to_date(v):
+        if v is None:
+            return None
+        if hasattr(v, "date"):
+            return v.date()
+        if isinstance(v, (str,)):
+            try:
+                return pd.to_datetime(v).date()
+            except Exception:
+                return None
+        return None
+
+    for idx, row in df.iterrows():
+        try:
+            car = int(float(str(row.get("Carreira") or "")))
+        except (ValueError, TypeError):
+            continue
+
+        cp     = str(row.get("C/P") or "").strip().upper()
+        dia    = _to_date(row.get("Dia"))
+        paragem = str(row.get("Designação Paragem") or "").strip().lower()
+
+        try:
+            ordem = int(float(str(row.get("Ordem") or "")))
+        except (ValueError, TypeError):
+            ordem = None
+
+        # Look up exec row
+        exec_row = None
+        if ordem is not None and dia is not None:
+            exec_row = by_ordem.get((car, cp, dia, ordem))
+        if exec_row is None and dia is not None and paragem:
+            exec_row = by_paragem.get((car, cp, dia, paragem))
+
+        for drv_col, exec_col in FILL_MAP:
+            if drv_col not in df.columns:
+                continue
+            current = row.get(drv_col)
+            is_empty = current is None or (isinstance(current, float) and pd.isna(current)) or str(current).strip() == ""
+
+            if not is_empty:
+                stats[drv_col]["already"] += 1
+                continue
+
+            if exec_row is None:
+                stats[drv_col]["not_found"] += 1
+                continue
+
+            val = exec_row.get(exec_col)
+            is_val_empty = val is None or (isinstance(val, float) and pd.isna(val))
+            if not is_val_empty:
+                df.at[idx, drv_col] = val
+                stats[drv_col]["filled"] += 1
+            else:
+                stats[drv_col]["not_found"] += 1
+
+    return df, stats
+
+
 def tab_correcoes_drivian():
-    """Tab: verificar ficheiro Drivian existente e gerar versão corrigida com dados da rede."""
-    st.header("🔧 Sugestões de Correções Drivian")
+    """Tab: preencher campos em falta no ficheiro Drivian com dados das pautas."""
+    st.header("🔧 Completar Pauta Drivian")
     st.caption(
-        "Carregue um ficheiro exportado do Drivian. A app compara com a rede carregada, "
-        "assinala discrepâncias e gera um ficheiro corrigido pronto para importar."
+        "Carregue um ficheiro exportado do Drivian com campos em falta "
+        "(Real, Ocupação, Atraso, Anomalia, Causa, Responsabilidade…). "
+        "A app cruza com as pautas carregadas e gera o ficheiro preenchido."
     )
 
-    routes = _get_state("routes")
-    routes_dict = _get_state("routes_dict", {})
+    # ── Source of execution data ──────────────────────────────────────────────
+    exec_df = _get_state("exec_df")
 
-    if not routes:
-        st.info("⬆️ Carregue primeiro o ficheiro de rede (Tab Rede Semanal).")
+    st.markdown("### 1. Dados de execução (pautas)")
+
+    if exec_df is not None:
+        exec_rows = exec_df[exec_df["carreira"].notna() & exec_df["cp"].notna()]
+        st.success(
+            f"✅ Pautas já carregadas na Tab 'Análise de Impacto' — "
+            f"**{len(exec_rows)}** registos de execução disponíveis."
+        )
+        use_session = True
+    else:
+        st.info("Sem pautas carregadas na sessão. Pode carregar um ficheiro de pautas abaixo, ou ir à Tab 'Análise de Impacto' primeiro.")
+        use_session = False
+
+    uploaded_exec_here = st.file_uploader(
+        "Ou carregue pautas aqui (CSV / XLS / XLSX)",
+        type=["csv", "xls", "xlsx"],
+        key="corr_exec_upload",
+        help="Opcional se as pautas já estiverem carregadas na Tab 2.",
+    )
+
+    if uploaded_exec_here is not None:
+        with st.spinner("A ler pautas…"):
+            try:
+                exec_df = parse_execution_file(uploaded_exec_here)
+                exec_rows = exec_df[exec_df["carreira"].notna() & exec_df["cp"].notna()]
+                st.success(f"✅ {len(exec_rows)} registos de execução carregados.")
+                use_session = True
+            except Exception as exc:
+                st.error(f"Erro ao ler pautas: {exc}")
+                return
+
+    if not use_session or exec_df is None:
+        st.warning("Carregue as pautas de execução para continuar.")
         return
 
-    rdict = routes_dict if routes_dict else {r["carreira"]: r for r in routes}
+    exec_rows = exec_df[exec_df["carreira"].notna() & exec_df["cp"].notna()].copy()
+    if exec_rows.empty:
+        st.warning("As pautas carregadas não têm registos de execução (campos Carreira e C/P em falta).")
+        return
 
-    # ── Upload ────────────────────────────────────────────────────────────────
+    # ── Upload Drivian template ───────────────────────────────────────────────
+    st.markdown("### 2. Ficheiro Drivian a preencher")
     uploaded_drv = st.file_uploader(
-        "Ficheiro exportado do Drivian (.xlsx / .xls)",
+        "Ficheiro exportado do Drivian (.xlsx / .xls) — com Previsto preenchido mas Real/Ocupação/etc. vazios",
         type=["xlsx", "xls"],
-        key="drivian_check_upload",
+        key="drivian_fill_upload",
     )
 
     if uploaded_drv is None:
-        st.info("Carregue um ficheiro exportado do Drivian para analisar.")
+        st.info("Carregue o ficheiro Drivian para preencher.")
         return
 
-    with st.spinner("A ler ficheiro…"):
+    with st.spinner("A ler ficheiro Drivian…"):
         try:
             drv_df = _parse_drivian_file(uploaded_drv)
         except Exception as exc:
@@ -3132,107 +3301,112 @@ def tab_correcoes_drivian():
         st.warning("Ficheiro vazio ou sem dados.")
         return
 
-    n_cars = drv_df["Carreira"].nunique() if "Carreira" in drv_df.columns else 0
+    n_cars_drv = drv_df["Carreira"].nunique() if "Carreira" in drv_df.columns else 0
+
     col_m1, col_m2, col_m3 = st.columns(3)
-    col_m1.metric("Linhas lidas", len(drv_df))
-    col_m2.metric("Carreiras no ficheiro", n_cars)
-    col_m3.metric("Carreiras na rede", len(rdict))
+    col_m1.metric("Linhas no ficheiro Drivian", len(drv_df))
+    col_m2.metric("Carreiras no ficheiro", n_cars_drv)
+    col_m3.metric("Registos de execução", len(exec_rows))
 
-    # ── Correction analysis ───────────────────────────────────────────────────
-    st.markdown("### Análise de discrepâncias")
-    with st.spinner("A comparar com a rede…"):
-        corrections_df = _find_corrections(drv_df, rdict)
-
-    if corrections_df.empty:
-        st.success("🎉 Nenhuma discrepância encontrada em relação à rede carregada.")
-    else:
-        # Summary by problem type
-        tipo_counts = corrections_df["Problema"].str.extract(r"^([⚠️❌🔄🕐]+\s*\w+[^—]*)")[0].value_counts()
-        st.warning(f"**{len(corrections_df)} problema(s) encontrado(s)**")
-
-        # Filter
-        tipos_uniq = ["(todos)"] + corrections_df["Problema"].str.replace(r"—.*", "", regex=True).str.strip().unique().tolist()
-        tipo_sel = st.selectbox("Filtrar por tipo", tipos_uniq, key="corr_tipo_filter")
-        df_show = corrections_df if tipo_sel == "(todos)" else corrections_df[corrections_df["Problema"].str.startswith(tipo_sel.split()[0])]
-
-        st.dataframe(
-            df_show,
-            hide_index=True,
-            use_container_width=True,
-            column_config={
-                "Carreira":    st.column_config.NumberColumn("Carreira", width="small"),
-                "Problema":    st.column_config.TextColumn("Problema", width="large"),
-                "Valor atual": st.column_config.TextColumn("Valor atual", width="medium"),
-                "Sugestão":    st.column_config.TextColumn("Sugestão", width="medium"),
-            },
-        )
-
-        # CSV export of corrections
-        csv_corr = corrections_df.to_csv(index=False).encode()
-        st.download_button(
-            "⬇️ Exportar lista de correções (.csv)",
-            data=csv_corr,
-            file_name=f"correcoes_drivian_{uploaded_drv.name}.csv",
-            mime="text/csv",
-            key="btn_dl_corrections",
-        )
-
-    # ── Generate corrected file ───────────────────────────────────────────────
-    st.markdown("---")
-    st.markdown("### Gerar ficheiro corrigido")
-    st.caption(
-        "Substitui os horários das carreiras encontradas na rede pelos dados da rede carregada. "
-        "Carreiras não encontradas na rede são mantidas tal como estão no ficheiro Drivian."
+    # ── Fields to fill selection ──────────────────────────────────────────────
+    st.markdown("### 3. Campos a preencher")
+    FILL_FIELDS = ["Real", "Viatura", "Ocupação", "Atraso", "Anomalia", "Causa", "Responsabilidade", "Real APL", "Real Telemetria", "Obs."]
+    sel_fields = st.multiselect(
+        "Campos a preencher",
+        FILL_FIELDS,
+        default=["Real", "Viatura", "Ocupação", "Atraso", "Anomalia", "Causa", "Responsabilidade"],
+        key="corr_fields",
     )
 
-    filtered2, pauta_date2, dc2, sub_rede2 = _drivian_filter_controls(routes, "corr")
+    # ── Preview of what can be matched ───────────────────────────────────────
+    with st.spinner("A construir índice de cruzamento…"):
+        lookup = _build_exec_lookup(exec_rows)
 
-    # Which carreiras are in the uploaded file
-    cars_in_file: set[int] = set()
-    if "Carreira" in drv_df.columns:
-        for v in drv_df["Carreira"].dropna():
-            try:
-                cars_in_file.add(int(float(str(v))))
-            except (ValueError, TypeError):
-                pass
+    n_by_ordem   = len(lookup["by_ordem"])
+    n_by_paragem = len(lookup["by_paragem"])
+    st.caption(f"Índice de cruzamento: {n_by_ordem} chaves por (Carreira+C/P+Dia+Ordem) · {n_by_paragem} por (Carreira+C/P+Dia+Paragem)")
 
-    # Intersect: file ∩ network ∩ filter
-    filtered_ids = {r["carreira"] for r in filtered2}
-    matched = [rdict[c] for c in cars_in_file if c in rdict and c in filtered_ids]
-    kept_as_is = cars_in_file - {r["carreira"] for r in matched}
+    # ── Fill & stats ──────────────────────────────────────────────────────────
+    st.markdown("### 4. Resultado do preenchimento")
 
-    col_s1, col_s2, col_s3 = st.columns(3)
-    col_s1.metric("A regenerar da rede", len(matched))
-    col_s2.metric("Mantidos do ficheiro", len(kept_as_is))
-    col_s3.metric("Total no output", len(matched) + len(kept_as_is))
+    with st.spinner("A preencher campos…"):
+        filled_df, stats = _fill_drivian_from_exec(drv_df, lookup)
 
-    if kept_as_is:
-        st.caption(f"Carreiras mantidas (não na rede ou fora do filtro): {sorted(kept_as_is)[:10]}")
+    # Summary table
+    summary_rows = []
+    for field in sel_fields:
+        if field in stats:
+            s = stats[field]
+            total = s["filled"] + s["already"] + s["not_found"]
+            summary_rows.append({
+                "Campo":          field,
+                "✅ Preenchidos":  s["filled"],
+                "🔵 Já tinham valor": s["already"],
+                "❌ Não encontrado": s["not_found"],
+                "Total linhas":   total,
+            })
 
-    if st.button("⚙️ Gerar ficheiro corrigido", type="primary", key="btn_gen_corrected"):
-        with st.spinner("A gerar…"):
-            all_rows2: list[dict] = []
-            for r in matched:
-                all_rows2 += _route_to_drivian_rows(r, pauta_date2, dc2, sub_rede2)
-            # Keep original rows for carreiras not in network
-            for c in kept_as_is:
-                for _, row in drv_df[drv_df["Carreira"] == c].iterrows():
-                    all_rows2.append({col: row.get(col) for col in _DRIVIAN_COLS})
+    if summary_rows:
+        st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
 
-        if not all_rows2:
-            st.warning("Nenhuma linha gerada.")
-            return
+    total_filled = sum(stats.get(f, {}).get("filled", 0) for f in sel_fields)
+    total_missing = sum(stats.get(f, {}).get("not_found", 0) for f in sel_fields)
 
-        xlsx_bytes2 = _build_drivian_xlsx(all_rows2)
-        fname2 = f"Pauta_Drivian_corrigida_{pauta_date2.strftime('%Y%m%d')}.xlsx"
-        st.success(f"✅ {len(all_rows2)} linhas · {len(matched)} regeneradas + {len(kept_as_is)} mantidas")
-        st.download_button(
-            label=f"⬇️ Descarregar {fname2}",
-            data=xlsx_bytes2,
-            file_name=fname2,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="btn_download_corrected",
+    if total_filled == 0:
+        st.warning(
+            "Nenhum campo foi preenchido. Verifique se as pautas têm a mesma data e carreiras que o ficheiro Drivian, "
+            "e se os campos Ordem/Paragem coincidem."
         )
+    else:
+        st.success(f"✅ **{total_filled}** preenchimentos realizados em {len(sel_fields)} campo(s).")
+    if total_missing > 0:
+        st.info(f"ℹ️ {total_missing} campo(s) sem correspondência nas pautas (linha pode não existir nas pautas).")
+
+    # Detailed view of rows still missing
+    EXEC_COL_MAP_INV = {
+        "Real": "real", "Viatura": "viatura", "Ocupação": "ocupacao",
+        "Atraso": "atraso_min", "Anomalia": "anomalia",
+        "Causa": "causa", "Responsabilidade": "responsabilidade",
+    }
+    missing_mask = pd.Series([False] * len(filled_df), index=filled_df.index)
+    for field in sel_fields:
+        if field in filled_df.columns:
+            col_mask = filled_df[field].isna() | (filled_df[field].astype(str).str.strip() == "")
+            missing_mask = missing_mask | col_mask
+
+    n_missing_rows = missing_mask.sum()
+    if n_missing_rows > 0:
+        with st.expander(f"🔍 Ver {n_missing_rows} linhas com campos ainda em falta"):
+            show_cols = ["Carreira", "C/P", "Dia", "Ordem", "Designação Paragem"] + [f for f in sel_fields if f in filled_df.columns]
+            st.dataframe(
+                filled_df[missing_mask][[c for c in show_cols if c in filled_df.columns]],
+                hide_index=True,
+                use_container_width=True,
+            )
+
+    # ── Download ──────────────────────────────────────────────────────────────
+    st.markdown("---")
+
+    # Apply field selection: restore None for fields NOT selected
+    out_df = filled_df.copy()
+    for field in FILL_FIELDS:
+        if field not in sel_fields and field in out_df.columns:
+            out_df[field] = drv_df[field]  # revert to original
+
+    xlsx_out = _build_drivian_xlsx([
+        {col: row.get(col) for col in _DRIVIAN_COLS}
+        for _, row in out_df.iterrows()
+    ])
+
+    fname_out = f"Pauta_Drivian_preenchida_{uploaded_drv.name.replace('.xlsx','').replace('.xls','')}.xlsx"
+    st.download_button(
+        label="⬇️ Descarregar ficheiro preenchido",
+        data=xlsx_out,
+        file_name=fname_out,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="btn_dl_filled",
+        type="primary",
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
