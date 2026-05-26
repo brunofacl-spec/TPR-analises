@@ -578,6 +578,168 @@ def parse_network_xlsm(file) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Proposta de alteração parser
+# ---------------------------------------------------------------------------
+
+def _parse_carreiras_sheet(ws) -> dict:
+    """Parse 'Carreiras' sheet of a proposta file.
+
+    The sheet uses the same Format A block structure as Horários, with
+    ATUAL schedule on the left (col 0) and FUTURO schedule on the right
+    (col ~11). Row 0 contains "FUTURO a iniciar em DD/MM" in the right header.
+
+    Returns dict with:
+        effective_date : str  (e.g. "13/04")
+        rows           : list of {carreira_atual, designacao_atual,
+                                  carreira_futuro, designacao_futuro}
+    """
+    result = {"effective_date": "", "rows": []}
+
+    # Determine which column the FUTURO block starts at by scanning row 0
+    futuro_col_offset = 11  # default
+
+    all_rows = list(ws.iter_rows(values_only=True))
+    if not all_rows:
+        return result
+
+    # Row 0: e.g. [(1, 'ATUAL'), (12, 'FUTURO a iniciar em 13/04')]
+    first_row = list(all_rows[0])
+    for i, cell in enumerate(first_row):
+        if cell and isinstance(cell, str):
+            low = cell.lower()
+            if "iniciar" in low or "futuro" in low:
+                if i > 0:
+                    futuro_col_offset = i - 1  # "Carreira" label is one col before the value
+                m = re.search(r"\d{1,2}/\d{2}(?:/\d{2,4})?", cell)
+                if m:
+                    result["effective_date"] = m.group(0)
+                break
+
+    # Scan rows for "Carreira" label blocks (same block format as Horários)
+    cur_car_atual = None
+    cur_des_atual = ""
+    cur_car_fut   = None
+    cur_des_fut   = ""
+
+    seen = set()
+
+    for row_raw in all_rows:
+        row = list(row_raw)
+        while len(row) < futuro_col_offset + 12:
+            row.append(None)
+
+        v0 = row[0]
+        v0s = str(v0 or "").strip()
+
+        if v0s == "Carreira":
+            # Flush previous
+            if cur_car_atual is not None and cur_car_atual not in seen:
+                result["rows"].append({
+                    "carreira_atual":    cur_car_atual,
+                    "designacao_atual":  cur_des_atual,
+                    "carreira_futuro":   cur_car_fut,
+                    "designacao_futuro": cur_des_fut,
+                })
+                seen.add(cur_car_atual)
+
+            # ATUAL carreira
+            try:
+                cur_car_atual = int(float(str(row[1]))) if row[1] is not None else None
+            except (ValueError, TypeError):
+                cur_car_atual = None
+            cur_des_atual = ""
+
+            # FUTURO carreira
+            fut_val = row[futuro_col_offset + 1] if futuro_col_offset + 1 < len(row) else None
+            try:
+                cur_car_fut = int(float(str(fut_val))) if fut_val is not None else cur_car_atual
+            except (ValueError, TypeError):
+                cur_car_fut = cur_car_atual
+            cur_des_fut = ""
+
+        elif v0s in ("Designação", "Designacao"):
+            cur_des_atual = str(row[1] or "").strip()
+            fut_val = row[futuro_col_offset + 1] if futuro_col_offset + 1 < len(row) else None
+            cur_des_fut = str(fut_val or "").strip()
+
+    # Flush last
+    if cur_car_atual is not None and cur_car_atual not in seen:
+        result["rows"].append({
+            "carreira_atual":    cur_car_atual,
+            "designacao_atual":  cur_des_atual,
+            "carreira_futuro":   cur_car_fut,
+            "designacao_futuro": cur_des_fut,
+        })
+
+    return result
+
+
+def parse_alteracao_xlsm(file) -> dict:
+    """Parse a 'Proposta de alteração' xlsm file.
+
+    Returns
+    -------
+    dict:
+        routes         : list of updated route dicts (from Horários sheet)
+        carreiras_info : parsed Carreiras sheet summary
+        effective_date : str date from Carreiras sheet
+    """
+    try:
+        if hasattr(file, "read"):
+            raw = file.read()
+        else:
+            with open(file, "rb") as fh:
+                raw = fh.read()
+        wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+    except Exception as exc:
+        logger.error("Failed to open alteracao file: %s", exc)
+        raise
+
+    sheetnames = wb.sheetnames
+    logger.info("Proposta sheets: %s", sheetnames)
+
+    # Find Horários sheet
+    horarios_name = next(
+        (s for s in sheetnames if s.lower().startswith("hor") and "rio" in s.lower()),
+        None,
+    )
+    if horarios_name is None:
+        raise ValueError(
+            f"Folha 'Horários' não encontrada na proposta. "
+            f"Folhas disponíveis: {list(sheetnames)}"
+        )
+
+    routes = _parse_format_a_named(wb, horarios_name)
+
+    # Tag reverse logistics
+    for route in routes:
+        route["is_reverse_logistics"] = detect_reverse_logistics(route)
+        route["reverse_leg_from"] = (
+            find_reverse_leg_from(route) if route["is_reverse_logistics"] else None
+        )
+
+    carreiras_info = {}
+    if "Carreiras" in sheetnames:
+        try:
+            carreiras_info = _parse_carreiras_sheet(wb["Carreiras"])
+        except Exception as e:
+            logger.warning("Carreiras sheet error: %s", e)
+
+    effective_date = carreiras_info.get("effective_date", "")
+
+    logger.info(
+        "Proposta parsed: %d routes, effective date: %r",
+        len(routes), effective_date,
+    )
+
+    return {
+        "routes":         routes,
+        "carreiras_info": carreiras_info,
+        "effective_date": effective_date,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Execution file parser
 # ---------------------------------------------------------------------------
 

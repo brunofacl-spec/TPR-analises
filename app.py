@@ -22,7 +22,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(__file__))
 
-from src.parser import parse_network_xlsm, parse_execution_file
+from src.parser import parse_network_xlsm, parse_execution_file, parse_alteracao_xlsm
 from src.network import build_dependency_graph, get_downstream, get_upstream
 from src.delays import calculate_cascade, get_initial_delays
 
@@ -150,6 +150,162 @@ def _rebuild_graph(routes: list[dict], window: int, sul_only: bool):
 # TAB 1 — Rede Semanal
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _apply_alteracao(current_routes: list[dict], new_routes: list[dict]) -> tuple[list[dict], int, int]:
+    """Merge new_routes into current_routes by carreira code.
+
+    Returns (merged_routes, n_updated, n_added).
+    """
+    current_by_id = {r["carreira"]: r for r in current_routes}
+    n_updated = 0
+    n_added = 0
+
+    for r in new_routes:
+        car = r["carreira"]
+        if car in current_by_id:
+            current_by_id[car] = r
+            n_updated += 1
+        else:
+            current_by_id[car] = r
+            n_added += 1
+
+    # Preserve original ordering, then append new ones
+    existing_ids = {r["carreira"] for r in current_routes}
+    merged = [current_by_id[r["carreira"]] for r in current_routes]
+    for r in new_routes:
+        if r["carreira"] not in existing_ids:
+            merged.append(r)
+
+    return merged, n_updated, n_added
+
+
+def _section_proposta_alteracao(routes: list[dict]):
+    """Render the 'Aplicar Proposta de Alteração' expander inside Tab 1."""
+    alteracoes_aplicadas = _get_state("alteracoes_aplicadas", [])
+
+    label = "📝 Aplicar Proposta de Alteração"
+    if alteracoes_aplicadas:
+        label += f"  ·  {len(alteracoes_aplicadas)} proposta(s) aplicada(s)"
+
+    with st.expander(label, expanded=False):
+        if alteracoes_aplicadas:
+            st.markdown("**Propostas já aplicadas:**")
+            for entry in alteracoes_aplicadas:
+                st.markdown(
+                    f"- **{entry['filename']}** — {entry['n_updated']} carreira(s) alterada(s), "
+                    f"{entry['n_added']} adicionada(s)"
+                    + (f" · vigência: {entry['effective_date']}" if entry.get("effective_date") else "")
+                )
+            if st.button("↩️ Repor rede original", key="btn_reset_alteracao"):
+                original = _get_state("routes_original")
+                if original:
+                    _set_state("routes", original)
+                    _set_state("alteracoes_aplicadas", [])
+                    window = _get_state("connection_window", 90)
+                    sul_only = _get_state("sul_only", False)
+                    _rebuild_graph(original, window, sul_only)
+                    st.success("Rede original reposta.")
+                    st.rerun()
+            st.markdown("---")
+
+        uploaded_prop = st.file_uploader(
+            "Ficheiro de proposta de alteração (.xlsm)",
+            type=["xlsm", "xlsx"],
+            key="alteracao_uploader",
+            help="Ficheiro com folha 'Horários' (mesmo formato da rede base) e folha 'Carreiras' com ATUAL vs FUTURO.",
+        )
+
+        if uploaded_prop is not None:
+            with st.spinner("A processar proposta de alteração…"):
+                try:
+                    raw_prop = uploaded_prop.read()
+                    import src.parser as _pm
+                    import importlib
+                    importlib.reload(_pm)
+                    from src.parser import parse_alteracao_xlsm as _parse_alt
+                    alt_data = _parse_alt(io.BytesIO(raw_prop))
+                    new_routes = alt_data["routes"]
+                    effective_date = alt_data.get("effective_date", "")
+                    carreiras_info = alt_data.get("carreiras_info", {})
+                except Exception as exc:
+                    st.error(f"Erro ao processar proposta: {exc}")
+                    logger.exception("Proposta parse error")
+                    return
+
+            if not new_routes:
+                st.warning("Nenhuma carreira encontrada na proposta.")
+                return
+
+            # Show preview before applying
+            current_ids = {r["carreira"] for r in routes}
+            to_update = [r for r in new_routes if r["carreira"] in current_ids]
+            to_add    = [r for r in new_routes if r["carreira"] not in current_ids]
+
+            st.markdown(f"**Proposta:** `{uploaded_prop.name}`")
+            if effective_date:
+                st.markdown(f"**Vigência:** {effective_date}")
+            st.markdown(
+                f"- 🔄 **{len(to_update)}** carreira(s) a substituir"
+                + (f"  |  ➕ **{len(to_add)}** carreira(s) novas" if to_add else "")
+            )
+
+            # Show diff table
+            if carreiras_info.get("rows"):
+                rows_info = carreiras_info["rows"]
+                df_diff = pd.DataFrame([
+                    {
+                        "Carreira (Atual)":     r["carreira_atual"],
+                        "Designação (Atual)":   r["designacao_atual"],
+                        "Carreira (Futuro)":    r["carreira_futuro"] or r["carreira_atual"],
+                        "Designação (Futuro)":  r["designacao_futuro"],
+                    }
+                    for r in rows_info
+                    if r["designacao_atual"] or r["designacao_futuro"]
+                ])
+                if not df_diff.empty:
+                    with st.expander("Ver tabela ATUAL vs FUTURO", expanded=False):
+                        st.dataframe(df_diff, hide_index=True, use_container_width=True)
+            else:
+                # Simple list of routes in proposal
+                df_new = pd.DataFrame([
+                    {
+                        "Carreira":   r["carreira"],
+                        "Designação": r.get("designacao", ""),
+                        "Rede":       r.get("rede", ""),
+                        "Estado":     "🔄 Substituição" if r["carreira"] in current_ids else "➕ Nova",
+                    }
+                    for r in new_routes
+                ])
+                with st.expander("Ver carreiras na proposta", expanded=False):
+                    st.dataframe(df_new, hide_index=True, use_container_width=True)
+
+            if st.button("✅ Aplicar proposta", key="btn_apply_alteracao", type="primary"):
+                # Save original only on first alteration
+                if not alteracoes_aplicadas:
+                    _set_state("routes_original", routes)
+
+                merged, n_updated, n_added = _apply_alteracao(routes, new_routes)
+                _set_state("routes", merged)
+
+                history = list(alteracoes_aplicadas)
+                history.append({
+                    "filename":       uploaded_prop.name,
+                    "effective_date": effective_date,
+                    "n_updated":      n_updated,
+                    "n_added":        n_added,
+                })
+                _set_state("alteracoes_aplicadas", history)
+
+                window   = _get_state("connection_window", 90)
+                sul_only = _get_state("sul_only", False)
+                _rebuild_graph(merged, window, sul_only)
+
+                st.success(
+                    f"✅ Proposta aplicada: {n_updated} carreira(s) alterada(s)"
+                    + (f", {n_added} adicionada(s)" if n_added else "")
+                    + (f" · vigência: {effective_date}" if effective_date else "")
+                )
+                st.rerun()
+
 _NETWORK_FILE_PATH = os.path.join(os.path.dirname(__file__), "data", "rede_atual.xlsm")
 _NETWORK_META_PATH = os.path.join(os.path.dirname(__file__), "data", "rede_meta.txt")
 
@@ -265,6 +421,11 @@ def tab_rede_semanal():
         st.info("⬆️ Carregue o ficheiro de rede para começar.")
         return
 
+    # ── Apply alteration proposal ────────────────────────────────────────────
+    _section_proposta_alteracao(routes)
+
+    # Refresh routes after possible alteration
+    routes = _get_state("routes")
     graph_routes = _get_state("graph_routes", routes)
 
     # ── Summary tables ──────────────────────────────────────────────────────
