@@ -666,6 +666,32 @@ def parse_execution_file(file) -> pd.DataFrame:
 
     df["carreira_str"] = df["carreira"].apply(_to_carreira_str)
 
+    # Auto-derive Anomalia when Atraso > 0 but Anomalia is blank.
+    # P row with delay → ATRASO PARTIDA; C row with delay → ATRASO CHEGADA.
+    def _fill_anomalia(row) -> str:
+        anom = str(row.get("anomalia") or "").strip()
+        if anom:
+            return anom
+        atraso = _parse_delay_value(row.get("atraso"))
+        if atraso and atraso > 0:
+            cp = str(row.get("cp") or "").strip().upper()
+            if cp == "P":
+                return "ATRASO PARTIDA"
+            if cp == "C":
+                return "ATRASO CHEGADA"
+        return anom
+
+    derived_mask = (
+        df["anomalia"].astype(str).str.strip().isin(["", "None", "nan"])
+        & (df["atraso_min"].fillna(0) > 0)
+    )
+    if derived_mask.any():
+        df.loc[derived_mask, "anomalia"] = df[derived_mask].apply(_fill_anomalia, axis=1)
+        logger.info(
+            "Auto-derived Anomalia for %d rows (ATRASO PARTIDA/CHEGADA from Atraso > 0)",
+            derived_mask.sum(),
+        )
+
     # Flag individual trips as reverse logistics via Obs. column
     def _trip_is_reverse(obs_val) -> bool:
         if obs_val is None:
