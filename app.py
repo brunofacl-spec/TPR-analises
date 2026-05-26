@@ -8,6 +8,7 @@ Streamlit application: 3 tabs
 from __future__ import annotations
 
 import io
+import datetime
 import logging
 import math
 from typing import Optional
@@ -2599,18 +2600,585 @@ def tab_ocupacao_grupagem():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# TAB 6 — Gerar Pauta Drivian
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_DRIVIAN_COLS = [
+    "Carreira", "Trajeto", "Ponto", "Ligação", "Viatura", "Ocupação",
+    "Rede", "C/P", "Dia", "Previsto", "Real", "Atrelado", "Ocupação Atrelados",
+    "Atraso", "Anomalia", "Causa", "Responsabilidade", "Designação Paragem",
+    "TP/RE", "Ordem", "Real APL", "Real Telemetria", "Obs.", "Transportador",
+    "Volume", "Disp/Conc", "início - intermédia", "mesmo dia - passa dia",
+    "data de início", "Sub Rede",
+]
+
+_HUB_KEYWORDS = [
+    "marl", "co s ", "co n ", "co pal", "co ben", "co ev", "co alg",
+    "cpl-s", "cpl-n", "cdp", "cpls", "cpln",
+]
+
+
+def _is_hub(name: str) -> bool:
+    low = (name or "").lower()
+    return any(k in low for k in _HUB_KEYWORDS)
+
+
+def _extract_volume(veiculo: str) -> Optional[int]:
+    """'23m3' → 23,  '45 M3' → 45, None if unparseable."""
+    if not veiculo:
+        return None
+    import re as _re
+    m = _re.search(r"(\d+)", str(veiculo))
+    return int(m.group(1)) if m else None
+
+
+def _minutes_to_time_date(
+    minutes: int, base_date: datetime.date
+) -> tuple[datetime.time, datetime.date]:
+    extra_days = minutes // 1440
+    mins_in_day = minutes % 1440
+    t = datetime.time(mins_in_day // 60, mins_in_day % 60)
+    d = base_date + datetime.timedelta(days=extra_days)
+    return t, d
+
+
+def _route_to_drivian_rows(
+    route: dict,
+    base_date: datetime.date,
+    disp_conc_override: str = "",
+    sub_rede_override: str = "",
+) -> list[dict]:
+    """Convert one route dict to a list of Drivian import rows."""
+    car       = route["carreira"]
+    desig     = route.get("designacao") or ""
+    rede      = route.get("rede") or ""
+    regiao    = route.get("regiao") or ""
+    transp    = route.get("transportador") or ""
+    veiculo   = route.get("veiculo") or ""
+    stops     = route.get("stops", [])
+
+    if not stops:
+        return []
+
+    vol = _extract_volume(veiculo)
+
+    # Re-apply overnight monotonicity fix to ALL stops (including first stop,
+    # which _fix_overnight skips).  We work on copies to avoid mutating cache.
+    fixed_times: list[tuple[Optional[int], Optional[int]]] = []
+    last_t = 0
+    for stop in stops:
+        hpc = stop.get("hpc")
+        hpp = stop.get("hpp")
+        if hpc is not None and hpc < last_t - 30:
+            hpc += 1440
+        if hpc is not None:
+            last_t = hpc
+        if hpp is not None and hpp < last_t - 30:
+            hpp += 1440
+        if hpp is not None:
+            last_t = hpp
+        fixed_times.append((hpc, hpp))
+
+    # Disp/Conc heuristic: last stop = hub → collecting (Concentração)
+    destino = route.get("destino") or (stops[-1].get("paragem") or "")
+    origem  = route.get("origem")  or (stops[0].get("paragem")  or "")
+    if disp_conc_override:
+        disp_conc = disp_conc_override
+    elif _is_hub(destino) and not _is_hub(origem):
+        disp_conc = "Concentração/Asc"
+    elif _is_hub(origem) and not _is_hub(destino):
+        disp_conc = "Dispersão/Desc"
+    else:
+        disp_conc = "Concentração/Asc"
+
+    # Sub Rede
+    sub_rede = sub_rede_override or (f"{rede} Exp" if rede else "")
+
+    # Determine whether route crosses midnight (passes day)
+    all_minutes = [v for pair in fixed_times for v in pair if v is not None]
+    passa_dia = any(m >= 1440 for m in all_minutes)
+    mesmo_dia_label = "passa dia" if passa_dia else "mesmo dia"
+
+    base_dt = datetime.datetime.combine(base_date, datetime.time(0, 0))
+
+    rows: list[dict] = []
+    ordem = 1
+    first_row = True
+
+    for stop, (hpc, hpp) in zip(stops, fixed_times):
+        paragem = stop.get("paragem") or ""
+
+        ini_label = "início" if first_row else "intermédia"
+
+        for cp, minutes in [("C", hpc), ("P", hpp)]:
+            if minutes is None:
+                continue
+
+            t, d = _minutes_to_time_date(minutes, base_date)
+
+            rows.append({
+                "Carreira":              car,
+                "Trajeto":               1,
+                "Ponto":                 None,
+                "Ligação":               desig,
+                "Viatura":               veiculo or None,
+                "Ocupação":              None,
+                "Rede":                  rede,
+                "C/P":                   cp,
+                "Dia":                   datetime.datetime.combine(d, datetime.time(0, 0)),
+                "Previsto":              t,
+                "Real":                  None,
+                "Atrelado":              None,
+                "Ocupação Atrelados":    None,
+                "Atraso":                None,
+                "Anomalia":              None,
+                "Causa":                 None,
+                "Responsabilidade":      None,
+                "Designação Paragem":    paragem,
+                "TP/RE":                 regiao,
+                "Ordem":                 ordem,
+                "Real APL":              None,
+                "Real Telemetria":       None,
+                "Obs.":                  None,
+                "Transportador":         transp,
+                "Volume":                vol,
+                "Disp/Conc":             disp_conc,
+                "início - intermédia":   ini_label,
+                "mesmo dia - passa dia": mesmo_dia_label,
+                "data de início":        base_dt,
+                "Sub Rede":              sub_rede,
+            })
+            ordem += 1
+            ini_label = "intermédia"
+            first_row = False
+
+    return rows
+
+
+def _build_drivian_xlsx(rows: list[dict]) -> bytes:
+    """Serialise Drivian rows to an .xlsx bytes buffer."""
+    import openpyxl as _opx
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    wb = _opx.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+
+    # Header row
+    for col_idx, col_name in enumerate(_DRIVIAN_COLS, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=col_name)
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill("solid", fgColor="DDEBF7")
+
+    # Data rows
+    for row_idx, row in enumerate(rows, start=2):
+        for col_idx, col_name in enumerate(_DRIVIAN_COLS, start=1):
+            val = row.get(col_name)
+            ws.cell(row=row_idx, column=col_idx, value=val)
+
+    # Auto-width (rough)
+    for col_idx, col_name in enumerate(_DRIVIAN_COLS, start=1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = max(12, len(col_name) + 2)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _parse_drivian_file(uploaded) -> pd.DataFrame:
+    raw = uploaded.read()
+    import openpyxl as _opx
+    wb = _opx.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+    ws = wb.active
+    all_rows = list(ws.iter_rows(values_only=True))
+    if not all_rows:
+        return pd.DataFrame()
+    headers = [str(c or "").strip() for c in all_rows[0]]
+    data = [dict(zip(headers, r)) for r in all_rows[1:]]
+    return pd.DataFrame(data)
+
+
+def _find_corrections(drivian_df: pd.DataFrame, routes_dict: dict) -> pd.DataFrame:
+    """Compare uploaded Drivian file against network routes; return correction table."""
+    import re as _re
+
+    corrections = []
+
+    if "Carreira" not in drivian_df.columns:
+        return pd.DataFrame()
+
+    for car_raw, grp in drivian_df.groupby("Carreira"):
+        try:
+            car = int(float(str(car_raw)))
+        except (ValueError, TypeError):
+            continue
+
+        route = routes_dict.get(car)
+        if route is None:
+            corrections.append({
+                "Carreira":    car,
+                "Ligação":     grp.iloc[0].get("Ligação", ""),
+                "Problema":    "⚠️ Carreira não encontrada na rede carregada",
+                "Campo":       "—",
+                "Valor atual": "—",
+                "Sugestão":    "—",
+            })
+            continue
+
+        route_stops = route.get("stops", [])
+
+        # Check Ligação vs designacao
+        desig_net = (route.get("designacao") or "").strip()
+        desig_drv = str(grp.iloc[0].get("Ligação") or "").strip()
+        if desig_net and desig_drv and desig_net != desig_drv:
+            corrections.append({
+                "Carreira":    car,
+                "Ligação":     desig_drv,
+                "Problema":    "🔄 Designação diferente da rede",
+                "Campo":       "Ligação",
+                "Valor atual": desig_drv,
+                "Sugestão":    desig_net,
+            })
+
+        # Check Viatura empty
+        viaturas = grp["Viatura"].dropna() if "Viatura" in grp.columns else pd.Series()
+        if viaturas.empty and route.get("veiculo"):
+            corrections.append({
+                "Carreira":    car,
+                "Ligação":     desig_drv,
+                "Problema":    "❌ Viatura em falta",
+                "Campo":       "Viatura",
+                "Valor atual": "",
+                "Sugestão":    route["veiculo"],
+            })
+
+        # Check Volume empty
+        vols = grp["Volume"].dropna() if "Volume" in grp.columns else pd.Series()
+        vol_sug = _extract_volume(route.get("veiculo") or "")
+        if vols.empty and vol_sug is not None:
+            corrections.append({
+                "Carreira":    car,
+                "Ligação":     desig_drv,
+                "Problema":    "❌ Volume em falta",
+                "Campo":       "Volume",
+                "Valor atual": "",
+                "Sugestão":    str(vol_sug),
+            })
+
+        # Check stop count
+        drv_stops = grp[grp["C/P"] == "C"] if "C/P" in grp.columns else grp
+        n_drv = len(drv_stops)
+        n_net = len(route_stops)
+        if n_net > 0 and n_drv != n_net:
+            corrections.append({
+                "Carreira":    car,
+                "Ligação":     desig_drv,
+                "Problema":    "⚠️ Número de paragens diferente",
+                "Campo":       "Paragens",
+                "Valor atual": str(n_drv),
+                "Sugestão":    str(n_net),
+            })
+
+        # Check Previsto times vs network hpc/hpp
+        if "C/P" in grp.columns and "Previsto" in grp.columns:
+            c_rows = grp[grp["C/P"] == "C"].reset_index(drop=True)
+            p_rows = grp[grp["C/P"] == "P"].reset_index(drop=True)
+
+            for i, stop in enumerate(route_stops):
+                # arrival
+                if i < len(c_rows):
+                    prev_drv = c_rows.iloc[i]["Previsto"]
+                    hpc_net  = stop.get("hpc")
+                    if hpc_net is not None and prev_drv is not None:
+                        try:
+                            if hasattr(prev_drv, "hour"):
+                                drv_min = prev_drv.hour * 60 + prev_drv.minute
+                            else:
+                                drv_min = None
+                            if drv_min is not None and abs(drv_min - (hpc_net % 1440)) > 0:
+                                net_t = f"{(hpc_net%1440)//60:02d}:{(hpc_net%1440)%60:02d}"
+                                drv_t = f"{prev_drv.hour:02d}:{prev_drv.minute:02d}" if hasattr(prev_drv, "hour") else str(prev_drv)
+                                corrections.append({
+                                    "Carreira":    car,
+                                    "Ligação":     desig_drv,
+                                    "Problema":    f"🕐 HPC diferente — paragem {i+1} ({stop.get('paragem','')})",
+                                    "Campo":       "Previsto (C)",
+                                    "Valor atual": drv_t,
+                                    "Sugestão":    net_t,
+                                })
+                        except Exception:
+                            pass
+                # departure
+                if i < len(p_rows):
+                    prev_drv = p_rows.iloc[i]["Previsto"]
+                    hpp_net  = stop.get("hpp")
+                    if hpp_net is not None and prev_drv is not None:
+                        try:
+                            if hasattr(prev_drv, "hour"):
+                                drv_min = prev_drv.hour * 60 + prev_drv.minute
+                            else:
+                                drv_min = None
+                            if drv_min is not None and abs(drv_min - (hpp_net % 1440)) > 0:
+                                net_t = f"{(hpp_net%1440)//60:02d}:{(hpp_net%1440)%60:02d}"
+                                drv_t = f"{prev_drv.hour:02d}:{prev_drv.minute:02d}" if hasattr(prev_drv, "hour") else str(prev_drv)
+                                corrections.append({
+                                    "Carreira":    car,
+                                    "Ligação":     desig_drv,
+                                    "Problema":    f"🕐 HPP diferente — paragem {i+1} ({stop.get('paragem','')})",
+                                    "Campo":       "Previsto (P)",
+                                    "Valor atual": drv_t,
+                                    "Sugestão":    net_t,
+                                })
+                        except Exception:
+                            pass
+
+    return pd.DataFrame(corrections) if corrections else pd.DataFrame(
+        columns=["Carreira", "Ligação", "Problema", "Campo", "Valor atual", "Sugestão"]
+    )
+
+
+def tab_gerar_pauta_drivian():
+    st.header("📤 Gerar Pauta Drivian")
+
+    routes = _get_state("routes")
+    routes_dict = _get_state("routes_dict", {})
+
+    if not routes:
+        st.info("⬆️ Carregue primeiro o ficheiro de rede (Tab 1).")
+        return
+
+    # ── Mode selector ──────────────────────────────────────────────────────────
+    mode = st.radio(
+        "Modo",
+        ["🆕 Gerar pauta de raiz", "🔍 Verificar & corrigir ficheiro Drivian existente"],
+        horizontal=True,
+        key="drivian_mode",
+    )
+
+    st.markdown("---")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # MODE A — Generate fresh
+    # ══════════════════════════════════════════════════════════════════════════
+    if mode.startswith("🆕"):
+        st.subheader("Gerar nova pauta")
+
+        col_date, col_rede, col_reg, col_transp = st.columns(4)
+        with col_date:
+            pauta_date = st.date_input(
+                "Data da pauta",
+                value=datetime.date.today(),
+                key="drivian_date",
+            )
+        with col_rede:
+            rede_opts = sorted({r.get("rede", "") for r in routes if r.get("rede")})
+            sel_rede = st.multiselect("Rede", rede_opts, default=rede_opts, key="drivian_rede")
+        with col_reg:
+            reg_opts = sorted({r.get("regiao", "") for r in routes if r.get("regiao")})
+            sel_reg = st.multiselect("Região", reg_opts, default=reg_opts, key="drivian_reg")
+        with col_transp:
+            tr_opts = ["(todos)"] + sorted({r.get("transportador", "") for r in routes if r.get("transportador")})
+            sel_tr = st.selectbox("Transportador", tr_opts, key="drivian_transp")
+
+        col_dc, col_sr = st.columns(2)
+        with col_dc:
+            disp_conc_mode = st.selectbox(
+                "Disp/Conc",
+                ["Automático (heurística hub)", "Concentração/Asc", "Dispersão/Desc"],
+                key="drivian_dc",
+            )
+        with col_sr:
+            sub_rede_override = st.text_input(
+                "Sub Rede (deixar vazio = automático)",
+                value="",
+                key="drivian_sr",
+                placeholder="ex: R3 Exp Clientes",
+            )
+
+        # Filter routes
+        filtered = [
+            r for r in routes
+            if (not sel_rede or r.get("rede", "") in sel_rede)
+            and (not sel_reg or r.get("regiao", "") in sel_reg)
+            and (sel_tr == "(todos)" or r.get("transportador", "") == sel_tr)
+        ]
+
+        st.caption(f"{len(filtered)} carreira(s) seleccionadas")
+
+        if not filtered:
+            st.warning("Nenhuma carreira corresponde aos filtros.")
+            return
+
+        # Preview
+        with st.expander("👁️ Pré-visualizar primeiras 5 carreiras", expanded=False):
+            preview_rows: list[dict] = []
+            for r in filtered[:5]:
+                dc = "" if disp_conc_mode.startswith("Automático") else disp_conc_mode
+                preview_rows += _route_to_drivian_rows(r, pauta_date, dc, sub_rede_override)
+            if preview_rows:
+                st.dataframe(pd.DataFrame(preview_rows)[_DRIVIAN_COLS[:15]], hide_index=True, use_container_width=True)
+
+        if st.button("⚙️ Gerar ficheiro Drivian", type="primary", key="btn_gen_drivian"):
+            with st.spinner("A gerar…"):
+                all_rows: list[dict] = []
+                for r in filtered:
+                    dc = "" if disp_conc_mode.startswith("Automático") else disp_conc_mode
+                    all_rows += _route_to_drivian_rows(r, pauta_date, dc, sub_rede_override)
+
+            if not all_rows:
+                st.warning("Nenhuma linha gerada (todas as carreiras sem paragens com tempos?).")
+                return
+
+            xlsx_bytes = _build_drivian_xlsx(all_rows)
+            fname = f"Pauta_Drivian_{pauta_date.strftime('%Y%m%d')}.xlsx"
+            st.success(f"✅ {len(all_rows)} linhas geradas para {len(filtered)} carreira(s).")
+            st.download_button(
+                label=f"⬇️ Descarregar {fname}",
+                data=xlsx_bytes,
+                file_name=fname,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="btn_download_drivian",
+            )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # MODE B — Check & correct existing Drivian file
+    # ══════════════════════════════════════════════════════════════════════════
+    else:
+        st.subheader("Verificar ficheiro Drivian existente")
+
+        uploaded_drv = st.file_uploader(
+            "Ficheiro exportado do Drivian (.xlsx)",
+            type=["xlsx", "xls"],
+            key="drivian_check_upload",
+        )
+
+        if uploaded_drv is None:
+            st.info("Carregue um ficheiro exportado do Drivian para verificar.")
+            return
+
+        with st.spinner("A analisar…"):
+            try:
+                drv_df = _parse_drivian_file(uploaded_drv)
+            except Exception as exc:
+                st.error(f"Erro ao ler ficheiro: {exc}")
+                return
+
+        if drv_df.empty:
+            st.warning("Ficheiro vazio ou sem dados.")
+            return
+
+        n_cars = drv_df["Carreira"].nunique() if "Carreira" in drv_df.columns else 0
+        st.success(f"✅ {len(drv_df)} linhas lidas · {n_cars} carreiras")
+
+        # Correction analysis
+        with st.spinner("A comparar com a rede…"):
+            corrections_df = _find_corrections(drv_df, routes_dict if routes_dict else {r["carreira"]: r for r in routes})
+
+        if corrections_df.empty:
+            st.success("🎉 Nenhuma discrepância encontrada em relação à rede carregada.")
+        else:
+            n_issues = len(corrections_df)
+            st.warning(f"**{n_issues} problema(s) encontrado(s)**")
+
+            # Filter by type
+            tipos = corrections_df["Problema"].str.extract(r"^([\w⚠️❌🔄🕐]+)")[0].unique().tolist()
+            st.dataframe(
+                corrections_df,
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "Carreira":    st.column_config.NumberColumn("Carreira", width="small"),
+                    "Problema":    st.column_config.TextColumn("Problema", width="large"),
+                    "Sugestão":    st.column_config.TextColumn("Sugestão", width="medium"),
+                },
+            )
+
+        # Generate corrected file
+        st.markdown("---")
+        st.subheader("Gerar ficheiro corrigido com dados da rede")
+
+        col_date2, col_dc2, col_sr2 = st.columns(3)
+        with col_date2:
+            pauta_date2 = st.date_input(
+                "Data da pauta",
+                value=datetime.date.today(),
+                key="drivian_date2",
+            )
+        with col_dc2:
+            disp_conc2 = st.selectbox(
+                "Disp/Conc",
+                ["Automático (heurística hub)", "Concentração/Asc", "Dispersão/Desc"],
+                key="drivian_dc2",
+            )
+        with col_sr2:
+            sub_rede2 = st.text_input(
+                "Sub Rede (vazio = automático)",
+                key="drivian_sr2",
+                placeholder="ex: R3 Exp Clientes",
+            )
+
+        # Which carreiras to regenerate: those in the uploaded file that exist in our network
+        cars_in_file = set()
+        if "Carreira" in drv_df.columns:
+            for v in drv_df["Carreira"].dropna():
+                try:
+                    cars_in_file.add(int(float(str(v))))
+                except (ValueError, TypeError):
+                    pass
+
+        rdict = routes_dict if routes_dict else {r["carreira"]: r for r in routes}
+        matched_routes = [rdict[c] for c in cars_in_file if c in rdict]
+        not_found = cars_in_file - set(rdict.keys())
+
+        st.caption(
+            f"{len(matched_routes)} carreira(s) encontrada(s) na rede"
+            + (f" · {len(not_found)} não encontrada(s): {sorted(not_found)[:5]}" if not_found else "")
+        )
+
+        if st.button("⚙️ Gerar ficheiro corrigido", type="primary", key="btn_gen_corrected"):
+            with st.spinner("A gerar…"):
+                all_rows2: list[dict] = []
+                for r in matched_routes:
+                    dc = "" if disp_conc2.startswith("Automático") else disp_conc2
+                    all_rows2 += _route_to_drivian_rows(r, pauta_date2, dc, sub_rede2)
+
+                # For carreiras not in network, keep original rows
+                for c in not_found:
+                    orig = drv_df[drv_df["Carreira"] == c]
+                    for _, row in orig.iterrows():
+                        all_rows2.append({col: row.get(col) for col in _DRIVIAN_COLS})
+
+            if not all_rows2:
+                st.warning("Nenhuma linha gerada.")
+                return
+
+            xlsx_bytes2 = _build_drivian_xlsx(all_rows2)
+            fname2 = f"Pauta_Drivian_corrigida_{pauta_date2.strftime('%Y%m%d')}.xlsx"
+            st.success(f"✅ {len(all_rows2)} linhas geradas.")
+            st.download_button(
+                label=f"⬇️ Descarregar {fname2}",
+                data=xlsx_bytes2,
+                file_name=fname2,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="btn_download_corrected",
+            )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Main entry point
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
     render_sidebar()
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "📋 Rede Semanal",
         "⏱️ Análise de Impacto de Atrasos",
         "🔍 Pesquisa de Carreira",
         "💡 Sugestões de Encadeamento",
         "📦 Ocupação & Grupagem",
+        "📤 Gerar Pauta Drivian",
     ])
 
     with tab1:
@@ -2627,6 +3195,9 @@ def main():
 
     with tab5:
         tab_ocupacao_grupagem()
+
+    with tab6:
+        tab_gerar_pauta_drivian()
 
 
 if __name__ == "__main__":
