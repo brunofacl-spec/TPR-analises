@@ -153,6 +153,9 @@ def _rebuild_graph(routes: list[dict], window: int, sul_only: bool):
 def _apply_alteracao(current_routes: list[dict], new_routes: list[dict]) -> tuple[list[dict], int, int]:
     """Merge new_routes into current_routes by carreira code.
 
+    For existing routes, metadata not present in the proposal (rede, regiao)
+    is preserved from the current network.
+
     Returns (merged_routes, n_updated, n_added).
     """
     current_by_id = {r["carreira"]: r for r in current_routes}
@@ -162,6 +165,11 @@ def _apply_alteracao(current_routes: list[dict], new_routes: list[dict]) -> tupl
     for r in new_routes:
         car = r["carreira"]
         if car in current_by_id:
+            existing = current_by_id[car]
+            # Preserve network metadata the proposal doesn't carry
+            for field in ("rede", "regiao"):
+                if not r.get(field) and existing.get(field):
+                    r[field] = existing[field]
             current_by_id[car] = r
             n_updated += 1
         else:
@@ -225,18 +233,22 @@ def _section_proposta_alteracao(routes: list[dict]):
                     alt_data = _parse_alt(io.BytesIO(raw_prop))
                     new_routes = alt_data["routes"]
                     effective_date = alt_data.get("effective_date", "")
-                    carreiras_info = alt_data.get("carreiras_info", {})
                 except Exception as exc:
                     st.error(f"Erro ao processar proposta: {exc}")
                     logger.exception("Proposta parse error")
                     return
 
             if not new_routes:
-                st.warning("Nenhuma carreira encontrada na proposta.")
+                st.warning(
+                    "Nenhuma carreira encontrada na proposta. "
+                    "Verifique se o ficheiro tem a folha 'Carreiras' preenchida "
+                    "(execute a macro Ctrl+E antes de guardar o ficheiro)."
+                )
                 return
 
             # Show preview before applying
             current_ids = {r["carreira"] for r in routes}
+            current_by_id = {r["carreira"]: r for r in routes}
             to_update = [r for r in new_routes if r["carreira"] in current_ids]
             to_add    = [r for r in new_routes if r["carreira"] not in current_ids]
 
@@ -248,35 +260,22 @@ def _section_proposta_alteracao(routes: list[dict]):
                 + (f"  |  ➕ **{len(to_add)}** carreira(s) novas" if to_add else "")
             )
 
-            # Show diff table
-            if carreiras_info.get("rows"):
-                rows_info = carreiras_info["rows"]
-                df_diff = pd.DataFrame([
-                    {
-                        "Carreira (Atual)":     r["carreira_atual"],
-                        "Designação (Atual)":   r["designacao_atual"],
-                        "Carreira (Futuro)":    r["carreira_futuro"] or r["carreira_atual"],
-                        "Designação (Futuro)":  r["designacao_futuro"],
-                    }
-                    for r in rows_info
-                    if r["designacao_atual"] or r["designacao_futuro"]
-                ])
-                if not df_diff.empty:
-                    with st.expander("Ver tabela ATUAL vs FUTURO", expanded=False):
-                        st.dataframe(df_diff, hide_index=True, use_container_width=True)
-            else:
-                # Simple list of routes in proposal
-                df_new = pd.DataFrame([
-                    {
-                        "Carreira":   r["carreira"],
-                        "Designação": r.get("designacao", ""),
-                        "Rede":       r.get("rede", ""),
-                        "Estado":     "🔄 Substituição" if r["carreira"] in current_ids else "➕ Nova",
-                    }
-                    for r in new_routes
-                ])
-                with st.expander("Ver carreiras na proposta", expanded=False):
-                    st.dataframe(df_new, hide_index=True, use_container_width=True)
+            # Show diff table comparing ATUAL stops vs FUTURO stops
+            rows_diff = []
+            for r in new_routes:
+                car = r["carreira"]
+                existing = current_by_id.get(car)
+                estado = "🔄 Substituição" if existing else "➕ Nova"
+                rows_diff.append({
+                    "Carreira":      car,
+                    "Designação":    r.get("designacao", ""),
+                    "Estado":        estado,
+                    "Paragens (fut)": len(r.get("stops", [])),
+                    "Paragens (atual)": len(existing.get("stops", [])) if existing else "—",
+                })
+            df_diff = pd.DataFrame(rows_diff)
+            with st.expander("Ver carreiras na proposta", expanded=True):
+                st.dataframe(df_diff, hide_index=True, use_container_width=True)
 
             if st.button("✅ Aplicar proposta", key="btn_apply_alteracao", type="primary"):
                 # Save original only on first alteration

@@ -581,108 +581,183 @@ def parse_network_xlsm(file) -> dict:
 # Proposta de alteração parser
 # ---------------------------------------------------------------------------
 
-def _parse_carreiras_sheet(ws) -> dict:
-    """Parse 'Carreiras' sheet of a proposta file.
+def _parse_carreiras_futuro_block(ws) -> tuple[str, list[dict]]:
+    """Parse the FUTURO block (cols L–T) of the Carreiras sheet.
 
-    The sheet uses the same Format A block structure as Horários, with
-    ATUAL schedule on the left (col 0) and FUTURO schedule on the right
-    (col ~11). Row 0 contains "FUTURO a iniciar em DD/MM" in the right header.
+    The macro (Ctrl+E / exec_base) creates the Carreiras sheet with:
+      - Row 0: "ATUAL" header | "FUTURO a iniciar em DD/MM" header
+      - Blocks of 20 rows each for every route:
+          Row +0: "Carreira"      | carreira_id      (col L=label, M=value)
+          Row +1: "Designação"    | designacao
+          Row +2: "Periodicidade" | periodicidade
+          Row +3: "Transportador" | transportador
+          Row +4: "Viatura"       | viatura
+          Row +5: column headers (Código, Designação, N.ºPar, HPC, HPP, TP, TT, Km, VM, ...)
+          Rows +6 to +17: stop data rows
+          Row +18: totals row
 
-    Returns dict with:
-        effective_date : str  (e.g. "13/04")
-        rows           : list of {carreira_atual, designacao_atual,
-                                  carreira_futuro, designacao_futuro}
+    FUTURO column layout (0-indexed):
+        L=11  label / stop code
+        M=12  value / stop name
+        N=13  N.ºPar
+        O=14  HPC  (new arrival time — user-edited)
+        P=15  HPP  (new departure time — user-edited)
+        Q=16  TP
+        R=17  TT
+        S=18  Km
+        T=19  VM
+        U=20  Dif.Hora  (formula — ignored)
+        V=21  Pausa     (formula — ignored)
+
+    Returns (effective_date, routes_list).
     """
-    result = {"effective_date": "", "rows": []}
+    # Column offsets for FUTURO block
+    C_LABEL = 11  # L
+    C_VALUE = 12  # M
+    C_NPAR  = 13  # N
+    C_HPC   = 14  # O
+    C_HPP   = 15  # P
+    C_TP    = 16  # Q
+    C_TT    = 17  # R
+    C_KM    = 18  # S
+    C_VM    = 19  # T
 
-    # Determine which column the FUTURO block starts at by scanning row 0
-    futuro_col_offset = 11  # default
+    effective_date = ""
+    routes: list[dict] = []
 
     all_rows = list(ws.iter_rows(values_only=True))
     if not all_rows:
-        return result
+        return effective_date, routes
 
-    # Row 0: e.g. [(1, 'ATUAL'), (12, 'FUTURO a iniciar em 13/04')]
-    first_row = list(all_rows[0])
-    for i, cell in enumerate(first_row):
+    # Extract effective date from row 0 — look for a cell with "iniciar" or "futuro"
+    for cell in all_rows[0]:
         if cell and isinstance(cell, str):
             low = cell.lower()
             if "iniciar" in low or "futuro" in low:
-                if i > 0:
-                    futuro_col_offset = i - 1  # "Carreira" label is one col before the value
                 m = re.search(r"\d{1,2}/\d{2}(?:/\d{2,4})?", cell)
                 if m:
-                    result["effective_date"] = m.group(0)
+                    effective_date = m.group(0)
                 break
 
-    # Scan rows for "Carreira" label blocks (same block format as Horários)
-    cur_car_atual = None
-    cur_des_atual = ""
-    cur_car_fut   = None
-    cur_des_fut   = ""
+    current: Optional[dict] = None
 
-    seen = set()
+    def _pad(row, n):
+        row = list(row)
+        while len(row) < n:
+            row.append(None)
+        return row
 
     for row_raw in all_rows:
-        row = list(row_raw)
-        while len(row) < futuro_col_offset + 12:
-            row.append(None)
+        row = _pad(row_raw, C_VM + 1)
 
-        v0 = row[0]
-        v0s = str(v0 or "").strip()
+        label = str(row[C_LABEL] or "").strip()
 
-        if v0s == "Carreira":
-            # Flush previous
-            if cur_car_atual is not None and cur_car_atual not in seen:
-                result["rows"].append({
-                    "carreira_atual":    cur_car_atual,
-                    "designacao_atual":  cur_des_atual,
-                    "carreira_futuro":   cur_car_fut,
-                    "designacao_futuro": cur_des_fut,
-                })
-                seen.add(cur_car_atual)
+        if label == "Carreira":
+            # Flush previous route
+            if current and current.get("stops"):
+                current["stops"] = _fix_overnight(current["stops"])
+                routes.append(current)
 
-            # ATUAL carreira
             try:
-                cur_car_atual = int(float(str(row[1]))) if row[1] is not None else None
+                car = int(float(str(row[C_VALUE]))) if row[C_VALUE] is not None else None
             except (ValueError, TypeError):
-                cur_car_atual = None
-            cur_des_atual = ""
+                car = None
+            if car is None:
+                current = None
+                continue
 
-            # FUTURO carreira
-            fut_val = row[futuro_col_offset + 1] if futuro_col_offset + 1 < len(row) else None
+            current = {
+                "carreira":      car,
+                "designacao":    None,
+                "periodicidade": None,
+                "transportador": None,
+                "veiculo":       None,
+                "rede":          "",
+                "regiao":        "",
+                "origem":        "",
+                "destino":       "",
+                "stops":         [],
+            }
+            continue
+
+        if current is None:
+            continue
+
+        if label == "Designação":
+            current["designacao"] = str(row[C_VALUE] or "").strip()
+        elif label == "Periodicidade":
+            current["periodicidade"] = str(row[C_VALUE] or "").strip()
+        elif label == "Transportador":
+            current["transportador"] = str(row[C_VALUE] or "").strip()
+        elif label == "Viatura":
+            current["veiculo"] = str(row[C_VALUE] or "").strip()
+        elif label in ("Código", "Codigo"):
+            continue  # column header row
+        elif label == "" and all(row[C_LABEL + i] is None for i in range(9)):
+            # Empty row — block separator; flush
+            if current and current.get("stops"):
+                current["stops"] = _fix_overnight(current["stops"])
+                routes.append(current)
+            current = None
+        else:
+            # Stop data row: col L = stop code (numeric)
             try:
-                cur_car_fut = int(float(str(fut_val))) if fut_val is not None else cur_car_atual
+                int(float(str(row[C_LABEL])))
             except (ValueError, TypeError):
-                cur_car_fut = cur_car_atual
-            cur_des_fut = ""
+                continue  # not a data row
 
-        elif v0s in ("Designação", "Designacao"):
-            cur_des_atual = str(row[1] or "").strip()
-            fut_val = row[futuro_col_offset + 1] if futuro_col_offset + 1 < len(row) else None
-            cur_des_fut = str(fut_val or "").strip()
+            stop_name = str(row[C_VALUE] or "").strip()
+            try:
+                n_par = int(row[C_NPAR]) if row[C_NPAR] is not None else None
+            except (ValueError, TypeError):
+                n_par = None
 
-    # Flush last
-    if cur_car_atual is not None and cur_car_atual not in seen:
-        result["rows"].append({
-            "carreira_atual":    cur_car_atual,
-            "designacao_atual":  cur_des_atual,
-            "carreira_futuro":   cur_car_fut,
-            "designacao_futuro": cur_des_fut,
-        })
+            hpc = _time_to_minutes(row[C_HPC])
+            hpp = _time_to_minutes(row[C_HPP])
 
-    return result
+            def _sf(v):
+                try:
+                    return float(v) if v is not None else None
+                except (ValueError, TypeError):
+                    return None
+
+            current["stops"].append({
+                "paragem": stop_name,
+                "n_par":   n_par,
+                "hpc":     hpc,
+                "hpp":     hpp,
+                "tp":      _sf(row[C_TP]),
+                "tt":      _sf(row[C_TT]),
+                "km":      _sf(row[C_KM]),
+                "tipo":    "",
+            })
+
+    # Flush last route
+    if current and current.get("stops"):
+        current["stops"] = _fix_overnight(current["stops"])
+        routes.append(current)
+
+    # Set origem/destino from first/last stop
+    for r in routes:
+        if r["stops"]:
+            r["origem"]  = r["stops"][0]["paragem"]
+            r["destino"] = r["stops"][-1]["paragem"]
+
+    return effective_date, routes
 
 
 def parse_alteracao_xlsm(file) -> dict:
     """Parse a 'Proposta de alteração' xlsm file.
 
+    Reads the **FUTURO block** (cols L–T) of the Carreiras sheet, which is
+    populated by the Ctrl+E macro from the Horários data and then manually
+    edited by the user to set the new HPC/HPP times.
+
     Returns
     -------
     dict:
-        routes         : list of updated route dicts (from Horários sheet)
-        carreiras_info : parsed Carreiras sheet summary
-        effective_date : str date from Carreiras sheet
+        routes         : list of updated route dicts (FUTURO schedule)
+        effective_date : str date extracted from Carreiras header (e.g. "13/04")
     """
     try:
         if hasattr(file, "read"):
@@ -698,18 +773,13 @@ def parse_alteracao_xlsm(file) -> dict:
     sheetnames = wb.sheetnames
     logger.info("Proposta sheets: %s", sheetnames)
 
-    # Find Horários sheet
-    horarios_name = next(
-        (s for s in sheetnames if s.lower().startswith("hor") and "rio" in s.lower()),
-        None,
-    )
-    if horarios_name is None:
+    if "Carreiras" not in sheetnames:
         raise ValueError(
-            f"Folha 'Horários' não encontrada na proposta. "
+            f"Folha 'Carreiras' não encontrada na proposta. "
             f"Folhas disponíveis: {list(sheetnames)}"
         )
 
-    routes = _parse_format_a_named(wb, horarios_name)
+    effective_date, routes = _parse_carreiras_futuro_block(wb["Carreiras"])
 
     # Tag reverse logistics
     for route in routes:
@@ -718,23 +788,13 @@ def parse_alteracao_xlsm(file) -> dict:
             find_reverse_leg_from(route) if route["is_reverse_logistics"] else None
         )
 
-    carreiras_info = {}
-    if "Carreiras" in sheetnames:
-        try:
-            carreiras_info = _parse_carreiras_sheet(wb["Carreiras"])
-        except Exception as e:
-            logger.warning("Carreiras sheet error: %s", e)
-
-    effective_date = carreiras_info.get("effective_date", "")
-
     logger.info(
-        "Proposta parsed: %d routes, effective date: %r",
+        "Proposta parsed: %d routes from Carreiras FUTURO block, effective date: %r",
         len(routes), effective_date,
     )
 
     return {
         "routes":         routes,
-        "carreiras_info": carreiras_info,
         "effective_date": effective_date,
     }
 
