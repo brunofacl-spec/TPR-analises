@@ -3417,13 +3417,13 @@ def main():
     render_sidebar()
 
     tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
-        "📋 Rede Semanal",
-        "⏱️ Análise de Impacto de Atrasos",
-        "🔍 Pesquisa de Carreira",
-        "💡 Sugestões de Encadeamento",
-        "📦 Ocupação & Grupagem",
+        "📋 Rede",
+        "⏱️ Atrasos",
+        "🔍 Carreira",
+        "💡 Encadeamento",
+        "📦 Ocupação",
         "✏️ Alterar Carreiras",
-        "📤 Gerar Pauta Drivian",
+        "📤 Pauta Drivian",
         "🔧 Correções Drivian",
     ])
 
