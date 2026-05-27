@@ -3416,12 +3416,10 @@ def tab_correcoes_drivian():
 def main():
     render_sidebar()
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "📋 Rede",
         "⏱️ Atrasos",
-        "🔍 Carreira",
         "💡 Encadeamento",
-        "📦 Ocupação",
         "✏️ Alterar Carreiras",
         "📤 Pauta Drivian",
         "🔧 Correções Drivian",
@@ -3432,16 +3430,12 @@ def main():
     with tab2:
         tab_impacto_atrasos()
     with tab3:
-        tab_pesquisa_carreira()
-    with tab4:
         tab_sugestoes_encadeamento()
-    with tab5:
-        tab_ocupacao_grupagem()
-    with tab6:
+    with tab4:
         tab_alterar_carreiras()
-    with tab7:
+    with tab5:
         tab_gerar_pauta_drivian()
-    with tab8:
+    with tab6:
         tab_correcoes_drivian()
 
 
