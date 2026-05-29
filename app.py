@@ -3410,19 +3410,417 @@ def tab_correcoes_drivian():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# TAB — Rede de Feriado
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Default hub keywords for each production centre
+_FERIADO_HUBS_DEFAULT: dict[str, list[str]] = {
+    "MARL":     ["MARL"],
+    "Perafita": ["Perafita"],
+    "CPLS":     ["CPLS"],
+    "CPLN":     ["CPLN"],
+}
+
+_FERIADO_PERIOD_KEYWORDS = ["feriado", "feriados", "fer.", "fer "]
+
+
+def _route_runs_on_holiday(route: dict, hub_keywords: dict[str, list[str]]) -> tuple[bool, str]:
+    """Return (True, reason) if a route should be in the holiday network.
+
+    Checks:
+      1. periodicidade contains a holiday keyword
+      2. Any stop name matches one of the configured hub keyword lists
+    """
+    period = (route.get("periodicidade") or "").lower()
+    for kw in _FERIADO_PERIOD_KEYWORDS:
+        if kw in period:
+            return True, f"Periodicidade: {route.get('periodicidade', '')}"
+
+    stop_names = [(s.get("paragem") or "").strip() for s in route.get("stops", [])]
+    for hub_label, keywords in hub_keywords.items():
+        for kw in keywords:
+            kw_lower = kw.lower()
+            for sn in stop_names:
+                if kw_lower in sn.lower():
+                    return True, f"Passa em {hub_label} ({sn})"
+
+    return False, ""
+
+
+def _build_holiday_excel(routes: list[dict]) -> bytes:
+    """Build an Excel workbook with the holiday network routes."""
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    wb = openpyxl.Workbook()
+    ws_resumo = wb.active
+    ws_resumo.title = "Resumo Feriado"
+
+    # ── Header style helpers ─────────────────────────────────────────────────
+    hdr_font  = Font(bold=True, color="FFFFFF")
+    hdr_fill  = PatternFill("solid", fgColor="1565C0")
+    sub_fill  = PatternFill("solid", fgColor="E3F2FD")
+    thin_side = Side(style="thin", color="BDBDBD")
+    thin_brd  = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+    center_al = Alignment(horizontal="center", vertical="center")
+
+    def _hdr(ws, row, col, value, fill=None):
+        cell = ws.cell(row=row, column=col, value=value)
+        cell.font = hdr_font
+        cell.fill = fill or hdr_fill
+        cell.alignment = center_al
+        cell.border = thin_brd
+        return cell
+
+    def _cell(ws, row, col, value):
+        cell = ws.cell(row=row, column=col, value=value)
+        cell.border = thin_brd
+        return cell
+
+    # ── Resumo sheet ─────────────────────────────────────────────────────────
+    resumo_cols = ["Carreira", "Designação", "Rede", "Região", "Transportador",
+                   "Veículo", "Periodicidade", "Origem", "Destino", "N.º Paragens"]
+    for c, col in enumerate(resumo_cols, 1):
+        _hdr(ws_resumo, 1, c, col)
+
+    for r_idx, route in enumerate(routes, 2):
+        vals = [
+            route.get("carreira"),
+            route.get("designacao", ""),
+            route.get("rede", ""),
+            route.get("regiao", ""),
+            route.get("transportador", ""),
+            route.get("veiculo", ""),
+            route.get("periodicidade", ""),
+            route.get("origem", ""),
+            route.get("destino", ""),
+            len(route.get("stops", [])),
+        ]
+        for c, v in enumerate(vals, 1):
+            _cell(ws_resumo, r_idx, c, v)
+
+    for c in range(1, len(resumo_cols) + 1):
+        ws_resumo.column_dimensions[get_column_letter(c)].width = 18
+    ws_resumo.freeze_panes = "A2"
+
+    # ── One sheet per route (Horários-style) ─────────────────────────────────
+    ws_hor = wb.create_sheet("Horários Feriado")
+
+    def _fmt_min(minutes):
+        if minutes is None:
+            return ""
+        h, m = divmod(int(minutes) % 1440, 60)
+        return f"{h:02d}:{m:02d}"
+
+    stop_cols = ["Código", "Paragem", "N.º Par.", "HPC", "HPP", "TP", "TT", "Km"]
+    current_row = 1
+
+    for route in routes:
+        # Route header
+        ws_hor.cell(row=current_row, column=1, value="Carreira").font = Font(bold=True)
+        ws_hor.cell(row=current_row, column=2, value=route.get("carreira"))
+        current_row += 1
+        ws_hor.cell(row=current_row, column=1, value="Designação").font = Font(bold=True)
+        ws_hor.cell(row=current_row, column=2, value=route.get("designacao", ""))
+        current_row += 1
+        ws_hor.cell(row=current_row, column=1, value="Periodicidade").font = Font(bold=True)
+        ws_hor.cell(row=current_row, column=2, value=route.get("periodicidade", ""))
+        current_row += 1
+        ws_hor.cell(row=current_row, column=1, value="Transportador").font = Font(bold=True)
+        ws_hor.cell(row=current_row, column=2, value=route.get("transportador", ""))
+        current_row += 1
+        ws_hor.cell(row=current_row, column=1, value="Viatura").font = Font(bold=True)
+        ws_hor.cell(row=current_row, column=2, value=route.get("veiculo", ""))
+        current_row += 1
+
+        # Stop column headers
+        for c, col in enumerate(stop_cols, 1):
+            cell = ws_hor.cell(row=current_row, column=c, value=col)
+            cell.font = Font(bold=True)
+            cell.fill = sub_fill
+        current_row += 1
+
+        # Stops
+        for i, stop in enumerate(route.get("stops", []), 1):
+            ws_hor.cell(row=current_row, column=1, value=i)
+            ws_hor.cell(row=current_row, column=2, value=stop.get("paragem", ""))
+            ws_hor.cell(row=current_row, column=3, value=stop.get("n_par"))
+            ws_hor.cell(row=current_row, column=4, value=_fmt_min(stop.get("hpc")))
+            ws_hor.cell(row=current_row, column=5, value=_fmt_min(stop.get("hpp")))
+            ws_hor.cell(row=current_row, column=6, value=stop.get("tp"))
+            ws_hor.cell(row=current_row, column=7, value=stop.get("tt"))
+            ws_hor.cell(row=current_row, column=8, value=stop.get("km"))
+            current_row += 1
+
+        # Blank separator row
+        current_row += 1
+
+    for c in range(1, len(stop_cols) + 1):
+        ws_hor.column_dimensions[get_column_letter(c)].width = 14
+    ws_hor.column_dimensions["B"].width = 30
+    ws_hor.freeze_panes = "A1"
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
+def tab_rede_feriado():
+    st.header("🗓️ Rede de Feriado")
+    st.caption(
+        "Define as carreiras que circulam em dias de feriado, com base na "
+        "periodicidade e nos centros de produção configurados. Exporta a rede "
+        "de feriado para Excel."
+    )
+
+    routes = _get_state("routes")
+    if not routes:
+        st.warning("⚠️ Carregue primeiro o ficheiro de rede na tab **Rede**.")
+        return
+
+    # ── Hub configuration ─────────────────────────────────────────────────────
+    with st.expander("⚙️ Configurar centros de produção", expanded=False):
+        st.markdown(
+            "Defina palavras-chave para identificar cada centro nas paragens. "
+            "Separe múltiplas palavras com vírgula."
+        )
+        col1, col2 = st.columns(2)
+        with col1:
+            marl_kw   = st.text_input("MARL (correio expresso)",    value="MARL",     key="fh_marl")
+            cpls_kw   = st.text_input("CPLS (centro de produção)",  value="CPLS",     key="fh_cpls")
+        with col2:
+            peraf_kw  = st.text_input("Perafita (correio expresso)", value="Perafita", key="fh_peraf")
+            cpln_kw   = st.text_input("CPLN (centro de produção)",  value="CPLN",     key="fh_cpln")
+
+    def _parse_kw(s: str) -> list[str]:
+        return [k.strip() for k in s.split(",") if k.strip()]
+
+    hub_keywords: dict[str, list[str]] = {
+        "MARL":     _parse_kw(marl_kw),
+        "Perafita": _parse_kw(peraf_kw),
+        "CPLS":     _parse_kw(cpls_kw),
+        "CPLN":     _parse_kw(cpln_kw),
+    }
+
+    # ── Auto-detect ───────────────────────────────────────────────────────────
+    auto_included: dict[int, str] = {}
+    for route in routes:
+        ok, reason = _route_runs_on_holiday(route, hub_keywords)
+        if ok:
+            auto_included[route["carreira"]] = reason
+
+    st.subheader(f"Detecção automática: {len(auto_included)} carreira(s)")
+    st.caption(
+        "Carreiras com 'feriado' na periodicidade **ou** que passam por um dos centros configurados."
+    )
+
+    # ── Manual override state ─────────────────────────────────────────────────
+    # feriado_added   : set of carreira IDs manually added
+    # feriado_removed : set of carreira IDs manually removed from auto list
+    if "feriado_added" not in st.session_state:
+        st.session_state["feriado_added"] = set()
+    if "feriado_removed" not in st.session_state:
+        st.session_state["feriado_removed"] = set()
+
+    added:   set = st.session_state["feriado_added"]
+    removed: set = st.session_state["feriado_removed"]
+
+    # Final set
+    final_ids: set[int] = (set(auto_included.keys()) - removed) | added
+
+    # ── Auto-detected table with remove buttons ───────────────────────────────
+    routes_dict = {r["carreira"]: r for r in routes}
+
+    if auto_included:
+        with st.expander(f"📋 Ver {len(auto_included)} carreiras auto-detectadas", expanded=True):
+            auto_rows = []
+            for car, reason in sorted(auto_included.items()):
+                r = routes_dict.get(car, {})
+                auto_rows.append({
+                    "Carreira":      car,
+                    "Designação":    r.get("designacao", ""),
+                    "Rede":          r.get("rede", ""),
+                    "Periodicidade": r.get("periodicidade", ""),
+                    "Razão":         reason,
+                    "Estado":        "❌ Removida" if car in removed else "✅ Incluída",
+                })
+            st.dataframe(pd.DataFrame(auto_rows), hide_index=True, use_container_width=True)
+
+    # ── Manual adjustments ────────────────────────────────────────────────────
+    st.subheader("Ajuste manual")
+
+    col_add, col_rem = st.columns(2)
+
+    with col_add:
+        st.markdown("**Adicionar carreira à rede de feriado**")
+        not_included = [r for r in routes if r["carreira"] not in final_ids]
+        if not_included:
+            add_options = {
+                f"{r['carreira']} — {r.get('designacao', '')}": r["carreira"]
+                for r in sorted(not_included, key=lambda x: x["carreira"])
+            }
+            sel_add = st.selectbox(
+                "Seleccionar carreira a adicionar",
+                options=[""] + list(add_options.keys()),
+                key="fh_add_sel",
+            )
+            if sel_add and st.button("➕ Adicionar", key="fh_btn_add"):
+                car_id = add_options[sel_add]
+                added.add(car_id)
+                removed.discard(car_id)
+                st.rerun()
+        else:
+            st.caption("Todas as carreiras já estão incluídas.")
+
+    with col_rem:
+        st.markdown("**Remover carreira da rede de feriado**")
+        included_list = sorted(final_ids)
+        rem_options = {
+            f"{car} — {routes_dict.get(car, {}).get('designacao', '')}": car
+            for car in included_list
+        }
+        sel_rem = st.selectbox(
+            "Seleccionar carreira a remover",
+            options=[""] + list(rem_options.keys()),
+            key="fh_rem_sel",
+        )
+        if sel_rem and st.button("➖ Remover", key="fh_btn_rem"):
+            car_id = rem_options[sel_rem]
+            removed.add(car_id)
+            added.discard(car_id)
+            st.rerun()
+
+    if added or removed:
+        col_r1, col_r2 = st.columns([1, 4])
+        with col_r1:
+            if st.button("↩️ Repor detecção automática", key="fh_btn_reset"):
+                st.session_state["feriado_added"] = set()
+                st.session_state["feriado_removed"] = set()
+                st.rerun()
+        if added:
+            st.caption(f"Adicionadas manualmente: {sorted(added)}")
+        if removed:
+            st.caption(f"Removidas manualmente: {sorted(removed)}")
+
+    st.markdown("---")
+
+    # ── Final holiday network ─────────────────────────────────────────────────
+    holiday_routes = [r for r in routes if r["carreira"] in final_ids]
+    holiday_routes.sort(key=lambda r: r["carreira"])
+
+    st.subheader(f"Rede de feriado final: {len(holiday_routes)} carreiras")
+
+    if not holiday_routes:
+        st.info("Nenhuma carreira seleccionada. Configure os centros ou adicione manualmente.")
+        return
+
+    # Summary metrics
+    c1, c2, c3, c4 = st.columns(4)
+    from collections import Counter
+    rede_ct = Counter(r.get("rede", "—") for r in holiday_routes)
+    c1.metric("R1", rede_ct.get("R1", 0))
+    c2.metric("R2", rede_ct.get("R2", 0))
+    c3.metric("R3", rede_ct.get("R3", 0))
+    c4.metric("Total", len(holiday_routes))
+
+    # Table
+    with st.expander("📄 Lista completa das carreiras de feriado", expanded=False):
+        summary_df = pd.DataFrame([
+            {
+                "Carreira":      r["carreira"],
+                "Designação":    r.get("designacao", ""),
+                "Rede":          r.get("rede", ""),
+                "Região":        r.get("regiao", ""),
+                "Transportador": r.get("transportador", ""),
+                "Periodicidade": r.get("periodicidade", ""),
+                "Origem":        r.get("origem", ""),
+                "Destino":       r.get("destino", ""),
+            }
+            for r in holiday_routes
+        ])
+        st.dataframe(summary_df, hide_index=True, use_container_width=True)
+
+    # ── Map ───────────────────────────────────────────────────────────────────
+    st.subheader("Mapa da rede de feriado")
+    coordinates = _get_state("coordinates", {})
+
+    with st.spinner("A gerar mapa…"):
+        # Build a sub-graph with only holiday routes for stop sizing
+        from src.network import build_dependency_graph as _bdg_fresh
+        try:
+            holiday_graph = _bdg_fresh(
+                holiday_routes,
+                connection_window_min=_get_state("connection_window", 90),
+            )
+        except Exception:
+            holiday_graph = None
+        fig_map = _build_map_graph(holiday_routes, coordinates, holiday_graph)
+
+    fig_map.update_layout(title="Rede de Feriado — Portugal")
+    st.plotly_chart(fig_map, use_container_width=True)
+
+    # ── Export ────────────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Exportar rede de feriado")
+
+    col_dl1, col_dl2 = st.columns(2)
+
+    with col_dl1:
+        with st.spinner("A preparar Excel…"):
+            xlsx_bytes = _build_holiday_excel(holiday_routes)
+        st.download_button(
+            label="⬇️ Descarregar Excel (Horários + Resumo)",
+            data=xlsx_bytes,
+            file_name="rede_feriado.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+        )
+
+    with col_dl2:
+        csv_rows = []
+        for r in holiday_routes:
+            for s in r.get("stops", []):
+                hpc = s.get("hpc")
+                hpp = s.get("hpp")
+                h, m = divmod(int(hpc) % 1440, 60) if hpc is not None else (None, None)
+                hpc_str = f"{h:02d}:{m:02d}" if hpc is not None else ""
+                h2, m2 = divmod(int(hpp) % 1440, 60) if hpp is not None else (None, None)
+                hpp_str = f"{h2:02d}:{m2:02d}" if hpp is not None else ""
+                csv_rows.append({
+                    "Carreira": r["carreira"],
+                    "Designação": r.get("designacao", ""),
+                    "Rede": r.get("rede", ""),
+                    "Transportador": r.get("transportador", ""),
+                    "Periodicidade": r.get("periodicidade", ""),
+                    "Paragem": s.get("paragem", ""),
+                    "HPC": hpc_str,
+                    "HPP": hpp_str,
+                })
+        csv_bytes = pd.DataFrame(csv_rows).to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            label="⬇️ Descarregar CSV (paragens)",
+            data=csv_bytes,
+            file_name="rede_feriado_paragens.csv",
+            mime="text/csv",
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Main entry point
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
     render_sidebar()
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "📋 Rede",
         "⏱️ Atrasos",
         "💡 Encadeamento",
         "✏️ Alterar Carreiras",
         "📤 Pauta Drivian",
         "🔧 Correções Drivian",
+        "🗓️ Rede de Feriado",
     ])
 
     with tab1:
@@ -3437,6 +3835,8 @@ def main():
         tab_gerar_pauta_drivian()
     with tab6:
         tab_correcoes_drivian()
+    with tab7:
+        tab_rede_feriado()
 
 
 if __name__ == "__main__":
