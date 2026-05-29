@@ -3413,50 +3413,146 @@ def tab_correcoes_drivian():
 # TAB — Rede de Feriado
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_FERIADO_PERIOD_KEYWORDS = ["feriado", "feriados", "fer.", "fer "]
-
-# Periodicidade day numbers (reuses _DAY_ABBR from tab Encadeamento)
 _DOW_FRIDAY = 4   # Sexta-feira
 _DOW_SUNDAY = 6   # Domingo
 
 
-def _parse_kw(s: str) -> list[str]:
-    return [k.strip() for k in s.split(",") if k.strip()]
+def _feriado_execucao_auto(route: dict, period_day: int) -> str:
+    """Return 'SIM' or 'NÃO' for a route on a given weekday (4=Fri, 6=Sun).
 
-
-def _route_hub_match(route: dict, hub_keywords: dict[str, list[str]]) -> str:
-    """Return hub label + stop if the route passes through any configured hub, else ''."""
-    stop_names = [(s.get("paragem") or "").strip() for s in route.get("stops", [])]
-    for hub_label, keywords in hub_keywords.items():
-        for kw in keywords:
-            kw_lower = kw.lower()
-            for sn in stop_names:
-                if kw_lower in sn.lower():
-                    return f"{hub_label} ({sn})"
-    return ""
-
-
-def _classify_route_feriado(
-    route: dict,
-    hub_keywords: dict[str, list[str]],
-) -> dict:
-    """Classify a route for the holiday planning.
-
-    Returns a dict with:
-        is_feriado_marked : bool — periodicidade contains a holiday keyword
-        runs_friday       : bool — runs on Fridays
-        runs_sunday       : bool — runs on Sundays
-        hub_match         : str  — which hub it serves (empty if none)
+    Rules (matching real-world practice):
+      - Reverse logistics (RIB) → always NÃO
+      - Route runs on the target day OR includes Saturday (for eve transitions) → SIM
+      - Otherwise → NÃO  (rare: single-day routes on other days)
     """
-    period_str = (route.get("periodicidade") or "").lower()
-    is_feriado = any(kw in period_str for kw in _FERIADO_PERIOD_KEYWORDS)
+    if route.get("is_reverse_logistics", False):
+        return "NÃO"
     days = _parse_periodicidade(route.get("periodicidade") or "")
+    # For eve (like Friday): accept Fri routes + Saturday-covering routes
+    # For holiday day (like Sunday): accept Sun routes + Saturday routes (return journeys)
+    if period_day in days:
+        return "SIM"
+    if 5 in days:          # includes Saturday — often covers transitions
+        return "SIM"
+    return "NÃO"
+
+
+def _route_rede_row(route: dict, exec_val: str = "") -> dict:
+    """Build a 'Rede de Feriado' summary row from a Horários-format route dict."""
+    stops = route.get("stops", [])
+
+    def _fmt(v):
+        if v is None:
+            return None
+        h, m = divmod(int(v) % 1440, 60)
+        return f"{h:02d}:{m:02d}"
+
+    apresentacao = _fmt(stops[0].get("hpc") if stops else None)
+    inicio       = _fmt(stops[0].get("hpp") if stops else None)
+    fim          = _fmt(stops[-1].get("hpc") if stops else None)
+
+    # Nr dias from periodicidade
+    days = _parse_periodicidade(route.get("periodicidade") or "")
+    nr_dias = len(days) if days != frozenset(range(7)) else 7
+
     return {
-        "is_feriado_marked": is_feriado,
-        "runs_friday":        _DOW_FRIDAY in days,
-        "runs_sunday":        _DOW_SUNDAY in days,
-        "hub_match":          _route_hub_match(route, hub_keywords),
+        "Carreira":      route.get("carreira"),
+        "Designação":    route.get("designacao", ""),
+        "Rede":          route.get("rede", ""),
+        "Transportador": (route.get("transportador") or "").strip(),
+        "Periodicidade": route.get("periodicidade", ""),
+        "Nr dias":       nr_dias,
+        "Veículo":       route.get("veiculo", ""),
+        "Km":            None,   # not available from Horários
+        "Apresentação":  apresentacao,
+        "Inicio":        inicio,
+        "Fim":           fim,
+        "GE Origem":     route.get("origem", ""),
+        "GE Destino":    route.get("destino", ""),
+        "_exec":         exec_val,
+        "Observações":   "",
+        "_rib":          route.get("is_reverse_logistics", False),
     }
+
+
+def _build_rede_feriado_excel(
+    rows_eve: list[dict],
+    rows_hol: list[dict],
+    exec_col_eve: str,
+    exec_col_hol: str,
+) -> bytes:
+    """Build Excel in the same format as Rede_Transportes_feriado_*.xlsm."""
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    thin_side = Side(style="thin", color="BDBDBD")
+    thin_brd  = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+    hdr_font  = Font(bold=True, color="FFFFFF")
+    sim_fill  = PatternFill("solid", fgColor="C8E6C9")   # light green
+    nao_fill  = PatternFill("solid", fgColor="FFCDD2")   # light red
+    rib_font  = Font(italic=True, color="9E9E9E")
+    hdr_blue  = PatternFill("solid", fgColor="1565C0")
+    hdr_purp  = PatternFill("solid", fgColor="6A1B9A")
+    center_al = Alignment(horizontal="center", vertical="center")
+
+    BASE_COLS = [
+        "Carreira", "Designação", "Rede", "Transportador", "Periodicidade",
+        "Nr dias", "Veículo", "Km", "Apresentação", "Inicio", "Fim",
+        "GE Origem", "GE Destino",
+    ]
+
+    def _write_rede_sheet(ws, rows: list[dict], exec_col: str, hdr_fill):
+        cols = BASE_COLS + [exec_col, "Observações"]
+        # Header row
+        for c, col in enumerate(cols, 1):
+            cell = ws.cell(row=1, column=c, value=col)
+            cell.font = hdr_font
+            cell.fill = hdr_fill
+            cell.alignment = center_al
+            cell.border = thin_brd
+        # Data rows
+        for r_idx, row in enumerate(rows, 2):
+            vals = [
+                row["Carreira"], row["Designação"], row["Rede"],
+                row["Transportador"], row["Periodicidade"], row["Nr dias"],
+                row["Veículo"], row["Km"], row["Apresentação"],
+                row["Inicio"], row["Fim"], row["GE Origem"], row["GE Destino"],
+                row["_exec"], row["Observações"],
+            ]
+            for c, v in enumerate(vals, 1):
+                cell = ws.cell(row=r_idx, column=c, value=v)
+                cell.border = thin_brd
+                if row.get("_rib"):
+                    cell.font = rib_font
+            # Colour the Execução cell
+            exec_cell = ws.cell(row=r_idx, column=14)
+            if row["_exec"] == "SIM":
+                exec_cell.fill = sim_fill
+            elif row["_exec"] == "NÃO":
+                exec_cell.fill = nao_fill
+        # Column widths
+        widths = [14, 52, 10, 14, 18, 8, 8, 6, 12, 8, 8, 14, 14, 32, 30]
+        for c, w in enumerate(widths, 1):
+            ws.column_dimensions[get_column_letter(c)].width = w
+        ws.freeze_panes = "A2"
+
+    wb = openpyxl.Workbook()
+
+    if rows_eve:
+        ws_eve = wb.active
+        ws_eve.title = "Véspera"
+        _write_rede_sheet(ws_eve, rows_eve, exec_col_eve, hdr_blue)
+    else:
+        wb.active.title = "Véspera"
+
+    if rows_hol:
+        ws_hol = wb.create_sheet("Feriado")
+        _write_rede_sheet(ws_hol, rows_hol, exec_col_hol, hdr_purp)
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
 
 
 def _build_holiday_excel(
@@ -3610,48 +3706,6 @@ def _build_holiday_excel(
     return out.getvalue()
 
 
-def _route_table_df(routes: list[dict], extra_col: Optional[str] = None) -> pd.DataFrame:
-    rows = []
-    for r in routes:
-        row = {
-            "Carreira":      r["carreira"],
-            "Designação":    r.get("designacao", ""),
-            "Rede":          r.get("rede", ""),
-            "Região":        r.get("regiao", ""),
-            "Transportador": r.get("transportador", ""),
-            "Periodicidade": r.get("periodicidade", ""),
-            "Origem":        r.get("origem", ""),
-            "Destino":       r.get("destino", ""),
-        }
-        if extra_col:
-            row[extra_col] = r.get("_reason", "")
-        rows.append(row)
-    return pd.DataFrame(rows)
-
-
-def _routes_csv(routes: list[dict], periodo: str = "") -> bytes:
-    csv_rows = []
-    def _fmt(v):
-        if v is None:
-            return ""
-        h, m = divmod(int(v) % 1440, 60)
-        return f"{h:02d}:{m:02d}"
-    for r in routes:
-        for s in r.get("stops", []):
-            csv_rows.append({
-                "Período":       periodo,
-                "Carreira":      r["carreira"],
-                "Designação":    r.get("designacao", ""),
-                "Rede":          r.get("rede", ""),
-                "Transportador": r.get("transportador", ""),
-                "Periodicidade": r.get("periodicidade", ""),
-                "Paragem":       s.get("paragem", ""),
-                "HPC":           _fmt(s.get("hpc")),
-                "HPP":           _fmt(s.get("hpp")),
-            })
-    return pd.DataFrame(csv_rows).to_csv(index=False).encode("utf-8-sig")
-
-
 def tab_rede_feriado():
     st.header("🗓️ Rede de Feriado")
     st.markdown(
@@ -3660,10 +3714,10 @@ A rede de feriado tem **dois momentos** distintos:
 
 | Período | Equivalente a | Lógica |
 |---|---|---|
-| 🌙 **Noite de véspera** (dia anterior ao feriado) | **Sexta-feira** | Saída do tratamento — carreiras Seg–Sex que servem os centros produtores |
-| ☀️ **Tarde/noite do feriado** | **Domingo** | Fim do período de feriado — carreiras de fim-de-semana/domingo |
+| 🌙 **Noite de véspera** (dia anterior ao feriado) | **Sexta-feira** | Saída do tratamento — carreiras Seg–Sex + Sáb não-RIB |
+| ☀️ **Tarde/noite do feriado** | **Domingo** | Carreiras de Domingo + Sáb não-RIB (retornos) |
 
-Carreiras marcadas com **Feriado** na periodicidade são sempre incluídas nos dois momentos.
+Carreiras **RIB** (logística inversa) são sempre marcadas **NÃO**. Os ajustes manuais têm prioridade.
         """
     )
 
@@ -3675,7 +3729,7 @@ Carreiras marcadas com **Feriado** na periodicidade são sempre incluídas nos d
     routes_dict = {r["carreira"]: r for r in routes}
 
     # ── Date selector ─────────────────────────────────────────────────────────
-    st.subheader("1. Seleccionar data do feriado")
+    st.subheader("1. Data do feriado")
     col_date, col_info = st.columns([1, 2])
     with col_date:
         holiday_date = st.date_input(
@@ -3684,253 +3738,204 @@ Carreiras marcadas com **Feriado** na periodicidade são sempre incluídas nos d
             key="fh_date",
         )
     eve_date = holiday_date - datetime.timedelta(days=1)
+
+    _pt_days = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"]
     with col_info:
         st.info(
-            f"🌙 **Véspera (como Sexta):** {eve_date.strftime('%d/%m/%Y')} ({eve_date.strftime('%A')})\n\n"
-            f"☀️ **Feriado (como Domingo):** {holiday_date.strftime('%d/%m/%Y')} ({holiday_date.strftime('%A')})"
+            f"🌙 **Véspera (como Sexta-feira):** {eve_date.strftime('%d/%m/%Y')} ({_pt_days[eve_date.weekday()]})\n\n"
+            f"☀️ **Feriado (como Domingo):** {holiday_date.strftime('%d/%m/%Y')} ({_pt_days[holiday_date.weekday()]})"
         )
 
-    eve_label     = f"Véspera {eve_date.strftime('%d/%m')}"
-    holiday_label = f"Feriado {holiday_date.strftime('%d/%m')}"
+    # Column labels for the Execução column
+    exec_col_eve = f"Execução noite de {eve_date.strftime('%d')} para {holiday_date.strftime('%d %b').lower()}"
+    exec_col_hol = f"Execução tarde/noite {holiday_date.strftime('%d %b').lower()}"
 
-    # ── Hub configuration ─────────────────────────────────────────────────────
-    st.subheader("2. Configurar centros de produção")
-    st.caption("Palavras-chave para identificar cada centro nas paragens. Separe múltiplas com vírgula.")
+    # ── Build "Rede" rows for ALL routes ──────────────────────────────────────
+    # Initialise / restore per-carreira override state
+    # State: dict { carreira_id: "SIM" | "NÃO" | None }  (None = use auto)
+    if "fh_overrides_eve" not in st.session_state:
+        st.session_state["fh_overrides_eve"] = {}
+    if "fh_overrides_hol" not in st.session_state:
+        st.session_state["fh_overrides_hol"] = {}
 
-    col1, col2, col3, col4 = st.columns(4)
-    marl_kw  = col1.text_input("🔵 MARL (Exp.)",     value="MARL",     key="fh_marl")
-    peraf_kw = col2.text_input("🔵 Perafita (Exp.)", value="Perafita", key="fh_peraf")
-    cpls_kw  = col3.text_input("🟢 CPLS (Prod.)",    value="CPLS",     key="fh_cpls")
-    cpln_kw  = col4.text_input("🟢 CPLN (Prod.)",    value="CPLN",     key="fh_cpln")
+    overrides_eve: dict = st.session_state["fh_overrides_eve"]
+    overrides_hol: dict = st.session_state["fh_overrides_hol"]
 
-    hub_keywords: dict[str, list[str]] = {
-        "MARL":     _parse_kw(marl_kw),
-        "Perafita": _parse_kw(peraf_kw),
-        "CPLS":     _parse_kw(cpls_kw),
-        "CPLN":     _parse_kw(cpln_kw),
-    }
-
-    # ── Classification ────────────────────────────────────────────────────────
-    # For each route, compute its classification
-    classified: dict[int, dict] = {}
+    # Compute auto SIM/NÃO and build rows
+    rede_rows_eve = []
+    rede_rows_hol = []
     for route in routes:
-        classified[route["carreira"]] = _classify_route_feriado(route, hub_keywords)
+        car = route["carreira"]
+        auto_eve = _feriado_execucao_auto(route, _DOW_FRIDAY)
+        auto_hol = _feriado_execucao_auto(route, _DOW_SUNDAY)
+        exec_eve = overrides_eve.get(car, auto_eve)
+        exec_hol = overrides_hol.get(car, auto_hol)
 
-    def _auto_select(period_day: int) -> dict[int, str]:
-        """Routes that run on period_day AND serve a hub, plus feriado-marked ones."""
-        result = {}
-        for route in routes:
-            cl = classified[route["carreira"]]
-            is_feriado = cl["is_feriado_marked"]
-            runs_day   = (period_day == _DOW_FRIDAY and cl["runs_friday"]) or \
-                         (period_day == _DOW_SUNDAY and cl["runs_sunday"])
-            hub        = cl["hub_match"]
+        row_eve = _route_rede_row(route, exec_eve)
+        row_hol = _route_rede_row(route, exec_hol)
+        row_eve["_auto"] = auto_eve
+        row_hol["_auto"] = auto_hol
+        row_eve["_overridden"] = car in overrides_eve
+        row_hol["_overridden"] = car in overrides_hol
 
-            if is_feriado:
-                result[route["carreira"]] = f"Periodicidade Feriado"
-            elif runs_day and hub:
-                day_name = "Sexta" if period_day == _DOW_FRIDAY else "Domingo"
-                result[route["carreira"]] = f"{day_name} · {hub}"
-        return result
+        rede_rows_eve.append(row_eve)
+        rede_rows_hol.append(row_hol)
 
-    auto_eve     = _auto_select(_DOW_FRIDAY)
-    auto_holiday = _auto_select(_DOW_SUNDAY)
+    # Sort by Carreira
+    rede_rows_eve.sort(key=lambda r: r["Carreira"])
+    rede_rows_hol.sort(key=lambda r: r["Carreira"])
 
-    # ── Manual override state ─────────────────────────────────────────────────
-    for key in ("fh_eve_added", "fh_eve_removed", "fh_hol_added", "fh_hol_removed"):
-        if key not in st.session_state:
-            st.session_state[key] = set()
-
-    eve_added   = st.session_state["fh_eve_added"]
-    eve_removed = st.session_state["fh_eve_removed"]
-    hol_added   = st.session_state["fh_hol_added"]
-    hol_removed = st.session_state["fh_hol_removed"]
-
-    final_eve = (set(auto_eve.keys()) - eve_removed) | eve_added
-    final_hol = (set(auto_holiday.keys()) - hol_removed) | hol_added
-
-    # ── Detection summary ─────────────────────────────────────────────────────
     st.markdown("---")
-    st.subheader("3. Carreiras detectadas automaticamente")
+
+    # ── Interactive table ─────────────────────────────────────────────────────
+    st.subheader("2. Rede de Feriado — Ajuste SIM / NÃO")
 
     tab_eve, tab_hol = st.tabs([
-        f"🌙 {eve_label} — como Sexta ({len(auto_eve)} carreiras)",
-        f"☀️ {holiday_label} — como Domingo ({len(auto_holiday)} carreiras)",
+        f"🌙 Véspera {eve_date.strftime('%d/%m')} — {sum(1 for r in rede_rows_eve if r['_exec']=='SIM')} SIM",
+        f"☀️ Feriado {holiday_date.strftime('%d/%m')} — {sum(1 for r in rede_rows_hol if r['_exec']=='SIM')} SIM",
     ])
 
-    def _render_auto_table(auto_dict, removed_set, label):
-        if not auto_dict:
-            st.info(f"Nenhuma carreira detectada para {label}. Verifique as palavras-chave dos centros.")
-            return
-        rows = []
-        for car, reason in sorted(auto_dict.items()):
-            r = routes_dict.get(car, {})
-            rows.append({
-                "Carreira":      car,
-                "Designação":    r.get("designacao", ""),
-                "Rede":          r.get("rede", ""),
-                "Periodicidade": r.get("periodicidade", ""),
-                "Razão":         reason,
-                "Estado":        "❌ Removida" if car in removed_set else "✅ Incluída",
+    def _render_rede_table(rede_rows, overrides, period_key):
+        sim_count  = sum(1 for r in rede_rows if r["_exec"] == "SIM")
+        nao_count  = sum(1 for r in rede_rows if r["_exec"] == "NÃO")
+        over_count = sum(1 for r in rede_rows if r["_overridden"])
+        c1, c2, c3 = st.columns(3)
+        c1.metric("SIM", sim_count)
+        c2.metric("NÃO", nao_count)
+        c3.metric("Ajustes manuais", over_count)
+
+        # Display table
+        display = []
+        for row in rede_rows:
+            display.append({
+                "Carreira":      row["Carreira"],
+                "Designação":    row["Designação"],
+                "Rede":          row["Rede"],
+                "Transportador": row["Transportador"],
+                "Periodicidade": row["Periodicidade"],
+                "Apresentação":  row["Apresentação"] or "—",
+                "Inicio":        row["Inicio"] or "—",
+                "Fim":           row["Fim"] or "—",
+                "GE Origem":     row["GE Origem"],
+                "GE Destino":    row["GE Destino"],
+                "Execução":      row["_exec"],
+                "Obs.":          "✏️" if row["_overridden"] else ("RIB" if row["_rib"] else ""),
             })
-        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        df = pd.DataFrame(display)
+        st.dataframe(
+            df.style.apply(
+                lambda col: [
+                    "background-color: #C8E6C9" if v == "SIM"
+                    else "background-color: #FFCDD2" if v == "NÃO"
+                    else ""
+                    for v in col
+                ] if col.name == "Execução" else [""] * len(col),
+            ),
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "Execução": st.column_config.TextColumn(width="small"),
+                "Obs.":     st.column_config.TextColumn(width="small"),
+            },
+        )
+
+        # ── Manual override ───────────────────────────────────────────────────
+        with st.expander("✏️ Ajustar SIM/NÃO individualmente"):
+            col_car, col_val, col_btn, col_rst = st.columns([3, 1, 1, 1])
+            car_options = {
+                f"{r['Carreira']} — {r['Designação'][:45]}": r["Carreira"]
+                for r in rede_rows
+            }
+            sel_car = col_car.selectbox(
+                "Carreira", [""] + list(car_options.keys()),
+                key=f"fh_{period_key}_car",
+            )
+            sel_val = col_val.selectbox(
+                "Execução", ["SIM", "NÃO"], key=f"fh_{period_key}_val",
+            )
+            if col_btn.button("Aplicar", key=f"fh_{period_key}_apply"):
+                if sel_car:
+                    overrides[car_options[sel_car]] = sel_val
+                    st.rerun()
+            if col_rst.button("Repor todos", key=f"fh_{period_key}_reset"):
+                overrides.clear()
+                st.rerun()
+
+            if overrides:
+                over_rows = [
+                    {"Carreira": car, "Override": val,
+                     "Auto": next((r["_auto"] for r in rede_rows if r["Carreira"] == car), "—")}
+                    for car, val in sorted(overrides.items())
+                ]
+                st.dataframe(pd.DataFrame(over_rows), hide_index=True, use_container_width=True)
 
     with tab_eve:
-        _render_auto_table(auto_eve, eve_removed, eve_label)
+        _render_rede_table(rede_rows_eve, overrides_eve, "eve")
     with tab_hol:
-        _render_auto_table(auto_holiday, hol_removed, holiday_label)
+        _render_rede_table(rede_rows_hol, overrides_hol, "hol")
 
-    # ── Manual adjustments ────────────────────────────────────────────────────
+    # ── Map view ──────────────────────────────────────────────────────────────
     st.markdown("---")
-    st.subheader("4. Ajuste manual")
-
-    def _manual_adjust_ui(period_label, final_ids, auto_ids, added_set, removed_set,
-                          key_add, key_rem, key_btn_add, key_btn_rem, key_btn_reset):
-        col_add, col_rem = st.columns(2)
-        with col_add:
-            st.markdown(f"**➕ Adicionar à rede de {period_label}**")
-            not_inc = [r for r in routes if r["carreira"] not in final_ids]
-            if not_inc:
-                opts = {f"{r['carreira']} — {r.get('designacao','')}": r["carreira"]
-                        for r in sorted(not_inc, key=lambda x: x["carreira"])}
-                sel = st.selectbox("Carreira", [""] + list(opts.keys()), key=key_add)
-                if sel and st.button("➕ Adicionar", key=key_btn_add):
-                    added_set.add(opts[sel])
-                    removed_set.discard(opts[sel])
-                    st.rerun()
-        with col_rem:
-            st.markdown(f"**➖ Remover da rede de {period_label}**")
-            inc_list = sorted(final_ids)
-            rem_opts = {f"{car} — {routes_dict.get(car,{}).get('designacao','')}": car
-                        for car in inc_list}
-            sel2 = st.selectbox("Carreira", [""] + list(rem_opts.keys()), key=key_rem)
-            if sel2 and st.button("➖ Remover", key=key_btn_rem):
-                removed_set.add(rem_opts[sel2])
-                added_set.discard(rem_opts[sel2])
-                st.rerun()
-        if added_set or removed_set:
-            if st.button("↩️ Repor detecção automática", key=key_btn_reset):
-                added_set.clear()
-                removed_set.clear()
-                st.rerun()
-            if added_set:
-                st.caption(f"Adicionadas: {sorted(added_set)}")
-            if removed_set:
-                st.caption(f"Removidas: {sorted(removed_set)}")
-
-    adj_eve, adj_hol = st.tabs([
-        f"🌙 Ajustar {eve_label}", f"☀️ Ajustar {holiday_label}"
-    ])
-    with adj_eve:
-        _manual_adjust_ui(
-            eve_label, final_eve, auto_eve,
-            eve_added, eve_removed,
-            "fh_eve_add_sel", "fh_eve_rem_sel",
-            "fh_eve_btn_add", "fh_eve_btn_rem", "fh_eve_btn_reset",
-        )
-    with adj_hol:
-        _manual_adjust_ui(
-            holiday_label, final_hol, auto_holiday,
-            hol_added, hol_removed,
-            "fh_hol_add_sel", "fh_hol_rem_sel",
-            "fh_hol_btn_add", "fh_hol_btn_rem", "fh_hol_btn_reset",
-        )
-
-    st.markdown("---")
-
-    # ── Final networks ────────────────────────────────────────────────────────
-    eve_routes_final = sorted(
-        [r for r in routes if r["carreira"] in final_eve],
-        key=lambda r: r["carreira"],
-    )
-    hol_routes_final = sorted(
-        [r for r in routes if r["carreira"] in final_hol],
-        key=lambda r: r["carreira"],
-    )
-
-    st.subheader("5. Redes finais")
-
-    from collections import Counter
-
-    def _metrics_row(routes_list, label, color_emoji):
-        rede_ct = Counter(r.get("rede", "—") for r in routes_list)
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric(f"{color_emoji} Total {label}", len(routes_list))
-        c2.metric("R1", rede_ct.get("R1", 0))
-        c3.metric("R2", rede_ct.get("R2", 0))
-        c4.metric("R3", rede_ct.get("R3", 0))
-
-    _metrics_row(eve_routes_final, eve_label, "🌙")
-    _metrics_row(hol_routes_final, holiday_label, "☀️")
-
-    view_eve, view_hol = st.tabs([
-        f"🌙 {eve_label} ({len(eve_routes_final)} carreiras)",
-        f"☀️ {holiday_label} ({len(hol_routes_final)} carreiras)",
-    ])
-
+    st.subheader("3. Mapa da rede de feriado")
     coordinates = _get_state("coordinates", {})
     window = _get_state("connection_window", 90)
 
-    def _render_network_view(routes_list, title):
-        if not routes_list:
-            st.info("Nenhuma carreira seleccionada.")
+    map_tab_eve, map_tab_hol = st.tabs([
+        f"🌙 Mapa Véspera {eve_date.strftime('%d/%m')}",
+        f"☀️ Mapa Feriado {holiday_date.strftime('%d/%m')}",
+    ])
+
+    def _render_holiday_map(rede_rows, map_title):
+        sim_routes = [routes_dict[r["Carreira"]] for r in rede_rows
+                      if r["_exec"] == "SIM" and r["Carreira"] in routes_dict]
+        if not sim_routes:
+            st.info("Nenhuma carreira com SIM para mostrar no mapa.")
             return
-        with st.expander("📄 Lista de carreiras", expanded=False):
-            st.dataframe(_route_table_df(routes_list), hide_index=True, use_container_width=True)
         with st.spinner("A gerar mapa…"):
             from src.network import build_dependency_graph as _bdg_fresh
             try:
-                g = _bdg_fresh(routes_list, connection_window_min=window)
+                g = _bdg_fresh(sim_routes, connection_window_min=window)
             except Exception:
                 g = None
-            fig = _build_map_graph(routes_list, coordinates, g)
-        fig.update_layout(title=title)
+            fig = _build_map_graph(sim_routes, coordinates, g)
+        fig.update_layout(title=map_title)
         st.plotly_chart(fig, use_container_width=True)
 
-    with view_eve:
-        _render_network_view(eve_routes_final, f"Rede {eve_label}")
-    with view_hol:
-        _render_network_view(hol_routes_final, f"Rede {holiday_label}")
+    with map_tab_eve:
+        _render_holiday_map(rede_rows_eve, f"Rede Véspera {eve_date.strftime('%d/%m/%Y')}")
+    with map_tab_hol:
+        _render_holiday_map(rede_rows_hol, f"Rede Feriado {holiday_date.strftime('%d/%m/%Y')}")
 
     # ── Export ────────────────────────────────────────────────────────────────
     st.markdown("---")
-    st.subheader("6. Exportar")
+    st.subheader("4. Exportar")
+    st.caption("O Excel gerado segue o mesmo formato do ficheiro de referência (folha 'Rede' com coluna Execução).")
 
-    col_xl, col_csv_eve, col_csv_hol = st.columns(3)
-
+    col_xl, col_note = st.columns([1, 2])
     with col_xl:
-        if eve_routes_final or hol_routes_final:
-            with st.spinner("A preparar Excel…"):
-                xlsx_bytes = _build_holiday_excel(
-                    eve_routes_final, hol_routes_final,
-                    eve_label=eve_label, holiday_label=holiday_label,
-                )
-            fname_xl = f"rede_feriado_{holiday_date.strftime('%Y%m%d')}.xlsx"
-            st.download_button(
-                label="⬇️ Excel completo (véspera + feriado)",
-                data=xlsx_bytes,
-                file_name=fname_xl,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary",
+        with st.spinner("A preparar Excel…"):
+            xlsx_bytes = _build_rede_feriado_excel(
+                rede_rows_eve, rede_rows_hol,
+                exec_col_eve, exec_col_hol,
             )
-
-    with col_csv_eve:
-        if eve_routes_final:
-            st.download_button(
-                label=f"⬇️ CSV {eve_label}",
-                data=_routes_csv(eve_routes_final, eve_label),
-                file_name=f"rede_vespera_{eve_date.strftime('%Y%m%d')}.csv",
-                mime="text/csv",
-            )
-
-    with col_csv_hol:
-        if hol_routes_final:
-            st.download_button(
-                label=f"⬇️ CSV {holiday_label}",
-                data=_routes_csv(hol_routes_final, holiday_label),
-                file_name=f"rede_feriado_{holiday_date.strftime('%Y%m%d')}.csv",
-                mime="text/csv",
-            )
+        fname_xl = f"Rede_Transportes_feriado_{holiday_date.strftime('%d%b%Y').lower()}.xlsx"
+        st.download_button(
+            label="⬇️ Descarregar Excel (Véspera + Feriado)",
+            data=xlsx_bytes,
+            file_name=fname_xl,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+        )
+    with col_note:
+        n_sim_eve = sum(1 for r in rede_rows_eve if r["_exec"] == "SIM")
+        n_sim_hol = sum(1 for r in rede_rows_hol if r["_exec"] == "SIM")
+        n_nao_eve = sum(1 for r in rede_rows_eve if r["_exec"] == "NÃO")
+        n_nao_hol = sum(1 for r in rede_rows_hol if r["_exec"] == "NÃO")
+        st.markdown(
+            f"**Véspera {eve_date.strftime('%d/%m')}:** {n_sim_eve} SIM · {n_nao_eve} NÃO  \n"
+            f"**Feriado {holiday_date.strftime('%d/%m')}:** {n_sim_hol} SIM · {n_nao_hol} NÃO  \n"
+            f"Ficheiro: `{fname_xl}`"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
