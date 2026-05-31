@@ -3413,31 +3413,77 @@ def tab_correcoes_drivian():
 # TAB — Rede de Feriado
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_DOW_FRIDAY = 4   # Sexta-feira
-_DOW_SUNDAY = 6   # Domingo
 
+def _feriado_execucao_auto(route: dict, period_dow: int) -> str:
+    """Return 'SIM' or 'NÃO' based on the actual day-of-week (0=Mon … 6=Sun).
 
-def _feriado_execucao_auto(route: dict, period_day: int) -> str:
-    """Return 'SIM' or 'NÃO' for a route on a given weekday (4=Fri, 6=Sun).
-
-    Rules (matching real-world practice):
-      - Reverse logistics (RIB) → always NÃO
-      - Route runs on the target day OR includes Saturday (for eve transitions) → SIM
-      - Otherwise → NÃO  (rare: single-day routes on other days)
+    Rules:
+      - RIB (logística inversa) → NÃO always
+      - periodicidade includes the target weekday → SIM
+        (the Apresentação time determines which day the route belongs to;
+         since periodicidade already encodes the day the route *presents*,
+         matching on the actual dow is the correct check)
+      - Otherwise → NÃO
     """
     if route.get("is_reverse_logistics", False):
         return "NÃO"
     days = _parse_periodicidade(route.get("periodicidade") or "")
-    # For eve (like Friday): accept Fri routes + Saturday-covering routes
-    # For holiday day (like Sunday): accept Sun routes + Saturday routes (return journeys)
-    if period_day in days:
-        return "SIM"
-    if 5 in days:          # includes Saturday — often covers transitions
+    if period_dow in days:
         return "SIM"
     return "NÃO"
 
 
-def _route_rede_row(route: dict, exec_val: str = "") -> dict:
+def _time_str_to_minutes(t_str: Optional[str]) -> Optional[int]:
+    """Convert 'HH:MM' string to minutes since midnight."""
+    if not t_str:
+        return None
+    try:
+        h, m = t_str.strip().split(":")
+        return int(h) * 60 + int(m)
+    except (ValueError, AttributeError):
+        return None
+
+
+def _centro_obs(
+    row: dict,
+    centros_config: list[dict],
+) -> Optional[str]:
+    """Return an observation string if the route arrives at a centro after closing.
+
+    centros_config: list of dicts with keys:
+        name       : str   — substring to match against GE Destino or Designação
+        period     : str   — "eve" | "hol" | "both"
+        close_min  : int   — closing time in minutes since midnight
+        close_label: str   — "HH:MM" for display
+
+    Returns None if no constraint is violated.
+    Returns e.g. "Centro CO PIN fechado às 22:00" if the route's Fim > close_min.
+    """
+    fim_str = row.get("Fim")
+    fim_min = _time_str_to_minutes(fim_str)
+    if fim_min is None:
+        return None
+
+    dest   = (row.get("GE Destino") or "").lower()
+    desig  = (row.get("Designação") or "").lower()
+
+    for cfg in centros_config:
+        name_lower = cfg["name"].lower()
+        if name_lower not in dest and name_lower not in desig:
+            continue
+        # Match: check if fim exceeds closing time
+        close_min = cfg["close_min"]
+        # Handle overnight closing (e.g. close at 02:00 means routes arriving
+        # after midnight but before 02:00 are still ok; routes arriving 02:01+
+        # are blocked). We model: if close_min < 360 (before 06h), it's an
+        # overnight closing → compare directly with fim_min, treating fim
+        # values > 1440 (next day) if needed.
+        if fim_min > close_min:
+            return f"Centro {cfg['name']} fecha às {cfg['close_label']}"
+    return None
+
+
+def _route_rede_row(route: dict, exec_val: str = "", obs: str = "") -> dict:
     """Build a 'Rede de Feriado' summary row from a Horários-format route dict."""
     stops = route.get("stops", [])
 
@@ -3447,31 +3493,38 @@ def _route_rede_row(route: dict, exec_val: str = "") -> dict:
         h, m = divmod(int(v) % 1440, 60)
         return f"{h:02d}:{m:02d}"
 
-    apresentacao = _fmt(stops[0].get("hpc") if stops else None)
-    inicio       = _fmt(stops[0].get("hpp") if stops else None)
-    fim          = _fmt(stops[-1].get("hpc") if stops else None)
+    # Apresentação = arrival time at first stop (hpc); fallback to departure (hpp)
+    apresentacao_min = stops[0].get("hpc") if stops else None
+    if apresentacao_min is None and stops:
+        apresentacao_min = stops[0].get("hpp")
+    inicio_min = stops[0].get("hpp") if stops else None
+    fim_min    = stops[-1].get("hpc") if stops else None
 
     # Nr dias from periodicidade
     days = _parse_periodicidade(route.get("periodicidade") or "")
     nr_dias = len(days) if days != frozenset(range(7)) else 7
 
     return {
-        "Carreira":      route.get("carreira"),
-        "Designação":    route.get("designacao", ""),
-        "Rede":          route.get("rede", ""),
-        "Transportador": (route.get("transportador") or "").strip(),
-        "Periodicidade": route.get("periodicidade", ""),
-        "Nr dias":       nr_dias,
-        "Veículo":       route.get("veiculo", ""),
-        "Km":            None,   # not available from Horários
-        "Apresentação":  apresentacao,
-        "Inicio":        inicio,
-        "Fim":           fim,
-        "GE Origem":     route.get("origem", ""),
-        "GE Destino":    route.get("destino", ""),
-        "_exec":         exec_val,
-        "Observações":   "",
-        "_rib":          route.get("is_reverse_logistics", False),
+        "Carreira":           route.get("carreira"),
+        "Designação":         route.get("designacao", ""),
+        "Rede":               route.get("rede", ""),
+        "Transportador":      (route.get("transportador") or "").strip(),
+        "Periodicidade":      route.get("periodicidade", ""),
+        "Nr dias":            nr_dias,
+        "Veículo":            route.get("veiculo", ""),
+        "Km":                 None,
+        "Apresentação":       _fmt(apresentacao_min),
+        "Inicio":             _fmt(inicio_min),
+        "Fim":                _fmt(fim_min),
+        "GE Origem":          route.get("origem", ""),
+        "GE Destino":         route.get("destino", ""),
+        "_exec":              exec_val,
+        "Observações":        obs,
+        "_rib":               route.get("is_reverse_logistics", False),
+        # Raw minutes for centro-closing comparisons
+        "_apresentacao_min":  apresentacao_min,
+        "_inicio_min":        inicio_min,
+        "_fim_min":           fim_min,
     }
 
 
@@ -3706,18 +3759,29 @@ def _build_holiday_excel(
     return out.getvalue()
 
 
+def _parse_time_input(s: str) -> Optional[int]:
+    """Parse 'HH:MM' → minutes. Returns None if invalid."""
+    if not s:
+        return None
+    s = s.strip()
+    try:
+        if ":" in s:
+            h, m = s.split(":", 1)
+            return int(h) * 60 + int(m)
+        return int(s) * 60
+    except (ValueError, AttributeError):
+        return None
+
+
 def tab_rede_feriado():
     st.header("🗓️ Rede de Feriado")
     st.markdown(
         """
-A rede de feriado tem **dois momentos** distintos:
-
-| Período | Equivalente a | Lógica |
-|---|---|---|
-| 🌙 **Noite de véspera** (dia anterior ao feriado) | **Sexta-feira** | Saída do tratamento — carreiras Seg–Sex + Sáb não-RIB |
-| ☀️ **Tarde/noite do feriado** | **Domingo** | Carreiras de Domingo + Sáb não-RIB (retornos) |
-
-Carreiras **RIB** (logística inversa) são sempre marcadas **NÃO**. Os ajustes manuais têm prioridade.
+**Lógica de classificação:**
+- A **hora de Apresentação** determina o dia da carreira: se apresenta às 23h de terça, é uma carreira de terça.
+- A periodicidade é comparada com o dia-da-semana real da véspera e do feriado (não são fixos Sexta/Domingo).
+- Carreiras **RIB** → sempre **NÃO**.
+- Centros de recepção com hora de fecho configurada → carreiras cujo **Fim** ultrapasse esse horário ficam **NÃO** automaticamente.
         """
     )
 
@@ -3728,7 +3792,7 @@ Carreiras **RIB** (logística inversa) são sempre marcadas **NÃO**. Os ajustes
 
     routes_dict = {r["carreira"]: r for r in routes}
 
-    # ── Date selector ─────────────────────────────────────────────────────────
+    # ── 1. Data do feriado ────────────────────────────────────────────────────
     st.subheader("1. Data do feriado")
     col_date, col_info = st.columns([1, 2])
     with col_date:
@@ -3738,21 +3802,73 @@ Carreiras **RIB** (logística inversa) são sempre marcadas **NÃO**. Os ajustes
             key="fh_date",
         )
     eve_date = holiday_date - datetime.timedelta(days=1)
+    eve_dow  = eve_date.weekday()      # 0=Mon … 6=Sun
+    hol_dow  = holiday_date.weekday()
 
     _pt_days = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"]
     with col_info:
         st.info(
-            f"🌙 **Véspera (como Sexta-feira):** {eve_date.strftime('%d/%m/%Y')} ({_pt_days[eve_date.weekday()]})\n\n"
-            f"☀️ **Feriado (como Domingo):** {holiday_date.strftime('%d/%m/%Y')} ({_pt_days[holiday_date.weekday()]})"
+            f"🌙 **Véspera:** {eve_date.strftime('%d/%m/%Y')} — **{_pt_days[eve_dow]}**"
+            f"  ·  carreiras com periodicidade que inclui {_pt_days[eve_dow]}\n\n"
+            f"☀️ **Feriado:** {holiday_date.strftime('%d/%m/%Y')} — **{_pt_days[hol_dow]}**"
+            f"  ·  carreiras com periodicidade que inclui {_pt_days[hol_dow]}"
         )
 
-    # Column labels for the Execução column
     exec_col_eve = f"Execução noite de {eve_date.strftime('%d')} para {holiday_date.strftime('%d %b').lower()}"
     exec_col_hol = f"Execução tarde/noite {holiday_date.strftime('%d %b').lower()}"
 
-    # ── Build "Rede" rows for ALL routes ──────────────────────────────────────
-    # Initialise / restore per-carreira override state
-    # State: dict { carreira_id: "SIM" | "NÃO" | None }  (None = use auto)
+    # ── 2. Centros de Recepção — horários de fecho ────────────────────────────
+    st.subheader("2. Horários de fecho dos centros de recepção")
+    st.caption(
+        "Adicione os centros que fecham em horário especial no feriado. "
+        "O nome é comparado com GE Destino e com a Designação da carreira (substring, sem maiúsculas/minúsculas). "
+        "Carreiras cujo **Fim** ultrapasse a hora de fecho ficam **NÃO** automaticamente."
+    )
+
+    if "fh_centros" not in st.session_state:
+        st.session_state["fh_centros"] = []   # list of dicts
+
+    centros_cfg: list[dict] = st.session_state["fh_centros"]
+
+    # Add new centro
+    with st.expander("➕ Adicionar centro de recepção", expanded=not centros_cfg):
+        cc1, cc2, cc3, cc4 = st.columns([2, 1, 1, 1])
+        new_centro  = cc1.text_input("Nome do centro (ex: CO PIN, RIO, Leiria…)", key="fh_c_name")
+        new_period  = cc2.selectbox("Período", ["Véspera", "Feriado", "Ambos"], key="fh_c_period")
+        new_close   = cc3.text_input("Hora de fecho (HH:MM)", placeholder="22:00", key="fh_c_close")
+        if cc4.button("Adicionar", key="fh_c_add"):
+            close_min = _parse_time_input(new_close)
+            if new_centro.strip() and close_min is not None:
+                centros_cfg.append({
+                    "name":        new_centro.strip(),
+                    "period":      new_period,
+                    "close_min":   close_min,
+                    "close_label": new_close.strip(),
+                })
+                st.rerun()
+            else:
+                st.error("Preencha o nome e a hora de fecho (HH:MM).")
+
+    if centros_cfg:
+        df_c = pd.DataFrame([{
+            "Centro": c["name"], "Período": c["period"],
+            "Fecha às": c["close_label"],
+        } for c in centros_cfg])
+        st.dataframe(df_c, hide_index=True, use_container_width=True)
+
+        rm_opts = [f"{c['name']} — {c['period']} às {c['close_label']}" for c in centros_cfg]
+        col_rm1, col_rm2 = st.columns([3, 1])
+        sel_rm = col_rm1.selectbox("Remover centro", [""] + rm_opts, key="fh_c_rm_sel")
+        if col_rm2.button("Remover", key="fh_c_rm_btn") and sel_rm:
+            idx = rm_opts.index(sel_rm)
+            centros_cfg.pop(idx)
+            st.rerun()
+
+    # Split centros by period for later use
+    centros_eve = [c for c in centros_cfg if c["period"] in ("Véspera", "Ambos")]
+    centros_hol = [c for c in centros_cfg if c["period"] in ("Feriado", "Ambos")]
+
+    # ── 3. Build "Rede" rows ──────────────────────────────────────────────────
     if "fh_overrides_eve" not in st.session_state:
         st.session_state["fh_overrides_eve"] = {}
     if "fh_overrides_hol" not in st.session_state:
@@ -3761,52 +3877,79 @@ Carreiras **RIB** (logística inversa) são sempre marcadas **NÃO**. Os ajustes
     overrides_eve: dict = st.session_state["fh_overrides_eve"]
     overrides_hol: dict = st.session_state["fh_overrides_hol"]
 
-    # Compute auto SIM/NÃO and build rows
     rede_rows_eve = []
     rede_rows_hol = []
+
     for route in routes:
         car = route["carreira"]
-        auto_eve = _feriado_execucao_auto(route, _DOW_FRIDAY)
-        auto_hol = _feriado_execucao_auto(route, _DOW_SUNDAY)
+
+        # Auto SIM/NÃO based on actual dow of eve/holiday
+        auto_eve = _feriado_execucao_auto(route, eve_dow)
+        auto_hol = _feriado_execucao_auto(route, hol_dow)
+
+        # Build row first (needed for centro check)
+        row_eve = _route_rede_row(route, auto_eve)
+        row_hol = _route_rede_row(route, auto_hol)
+
+        # Centro de recepção check (only if auto is SIM and no manual override yet)
+        obs_eve, obs_hol = "", ""
+        if auto_eve == "SIM" and car not in overrides_eve:
+            centro_block = _centro_obs(row_eve, centros_eve)
+            if centro_block:
+                auto_eve = "NÃO"
+                obs_eve  = centro_block
+        if auto_hol == "SIM" and car not in overrides_hol:
+            centro_block = _centro_obs(row_hol, centros_hol)
+            if centro_block:
+                auto_hol = "NÃO"
+                obs_hol  = centro_block
+
+        # Apply manual overrides (override wins over centro rule)
         exec_eve = overrides_eve.get(car, auto_eve)
         exec_hol = overrides_hol.get(car, auto_hol)
 
-        row_eve = _route_rede_row(route, exec_eve)
-        row_hol = _route_rede_row(route, exec_hol)
-        row_eve["_auto"] = auto_eve
-        row_hol["_auto"] = auto_hol
+        row_eve["_exec"]       = exec_eve
+        row_eve["Observações"] = obs_eve if car not in overrides_eve else "✏️ Manual"
+        row_eve["_auto"]       = auto_eve
         row_eve["_overridden"] = car in overrides_eve
+
+        row_hol["_exec"]       = exec_hol
+        row_hol["Observações"] = obs_hol if car not in overrides_hol else "✏️ Manual"
+        row_hol["_auto"]       = auto_hol
         row_hol["_overridden"] = car in overrides_hol
 
         rede_rows_eve.append(row_eve)
         rede_rows_hol.append(row_hol)
 
-    # Sort by Carreira
     rede_rows_eve.sort(key=lambda r: r["Carreira"])
     rede_rows_hol.sort(key=lambda r: r["Carreira"])
 
     st.markdown("---")
 
-    # ── Interactive table ─────────────────────────────────────────────────────
-    st.subheader("2. Rede de Feriado — Ajuste SIM / NÃO")
+    # ── 3. Interactive table + manual override ────────────────────────────────
+    st.subheader("3. Rede de Feriado — SIM / NÃO")
 
     tab_eve, tab_hol = st.tabs([
-        f"🌙 Véspera {eve_date.strftime('%d/%m')} — {sum(1 for r in rede_rows_eve if r['_exec']=='SIM')} SIM",
-        f"☀️ Feriado {holiday_date.strftime('%d/%m')} — {sum(1 for r in rede_rows_hol if r['_exec']=='SIM')} SIM",
+        f"🌙 Véspera {eve_date.strftime('%d/%m')} ({_pt_days[eve_dow]}) — {sum(1 for r in rede_rows_eve if r['_exec']=='SIM')} SIM",
+        f"☀️ Feriado {holiday_date.strftime('%d/%m')} ({_pt_days[hol_dow]}) — {sum(1 for r in rede_rows_hol if r['_exec']=='SIM')} SIM",
     ])
 
     def _render_rede_table(rede_rows, overrides, period_key):
         sim_count  = sum(1 for r in rede_rows if r["_exec"] == "SIM")
         nao_count  = sum(1 for r in rede_rows if r["_exec"] == "NÃO")
         over_count = sum(1 for r in rede_rows if r["_overridden"])
-        c1, c2, c3 = st.columns(3)
+        centro_nao = sum(1 for r in rede_rows if r["Observações"] and "fecha" in r["Observações"].lower())
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("SIM", sim_count)
         c2.metric("NÃO", nao_count)
-        c3.metric("Ajustes manuais", over_count)
+        c3.metric("Bloqueadas por centro", centro_nao)
+        c4.metric("Ajustes manuais", over_count)
 
-        # Display table
         display = []
         for row in rede_rows:
+            obs = row["Observações"]
+            if row["_rib"] and not obs:
+                obs = "RIB"
             display.append({
                 "Carreira":      row["Carreira"],
                 "Designação":    row["Designação"],
@@ -3816,10 +3959,9 @@ Carreiras **RIB** (logística inversa) são sempre marcadas **NÃO**. Os ajustes
                 "Apresentação":  row["Apresentação"] or "—",
                 "Inicio":        row["Inicio"] or "—",
                 "Fim":           row["Fim"] or "—",
-                "GE Origem":     row["GE Origem"],
                 "GE Destino":    row["GE Destino"],
                 "Execução":      row["_exec"],
-                "Obs.":          "✏️" if row["_overridden"] else ("RIB" if row["_rib"] else ""),
+                "Observações":   obs,
             })
         df = pd.DataFrame(display)
         st.dataframe(
@@ -3834,12 +3976,12 @@ Carreiras **RIB** (logística inversa) são sempre marcadas **NÃO**. Os ajustes
             hide_index=True,
             use_container_width=True,
             column_config={
-                "Execução": st.column_config.TextColumn(width="small"),
-                "Obs.":     st.column_config.TextColumn(width="small"),
+                "Execução":   st.column_config.TextColumn(width="small"),
+                "Observações": st.column_config.TextColumn(width="medium"),
             },
         )
 
-        # ── Manual override ───────────────────────────────────────────────────
+        # Manual override
         with st.expander("✏️ Ajustar SIM/NÃO individualmente"):
             col_car, col_val, col_btn, col_rst = st.columns([3, 1, 1, 1])
             car_options = {
@@ -3874,11 +4016,11 @@ Carreiras **RIB** (logística inversa) são sempre marcadas **NÃO**. Os ajustes
     with tab_hol:
         _render_rede_table(rede_rows_hol, overrides_hol, "hol")
 
-    # ── Map view ──────────────────────────────────────────────────────────────
+    # ── 4. Map ────────────────────────────────────────────────────────────────
     st.markdown("---")
-    st.subheader("3. Mapa da rede de feriado")
+    st.subheader("4. Mapa da rede de feriado")
     coordinates = _get_state("coordinates", {})
-    window = _get_state("connection_window", 90)
+    window      = _get_state("connection_window", 90)
 
     map_tab_eve, map_tab_hol = st.tabs([
         f"🌙 Mapa Véspera {eve_date.strftime('%d/%m')}",
@@ -3906,10 +4048,10 @@ Carreiras **RIB** (logística inversa) são sempre marcadas **NÃO**. Os ajustes
     with map_tab_hol:
         _render_holiday_map(rede_rows_hol, f"Rede Feriado {holiday_date.strftime('%d/%m/%Y')}")
 
-    # ── Export ────────────────────────────────────────────────────────────────
+    # ── 5. Export ─────────────────────────────────────────────────────────────
     st.markdown("---")
-    st.subheader("4. Exportar")
-    st.caption("O Excel gerado segue o mesmo formato do ficheiro de referência (folha 'Rede' com coluna Execução).")
+    st.subheader("5. Exportar")
+    st.caption("Mesmo formato do ficheiro de referência: folha 'Rede' com coluna Execução colorida.")
 
     col_xl, col_note = st.columns([1, 2])
     with col_xl:
@@ -3932,8 +4074,8 @@ Carreiras **RIB** (logística inversa) são sempre marcadas **NÃO**. Os ajustes
         n_nao_eve = sum(1 for r in rede_rows_eve if r["_exec"] == "NÃO")
         n_nao_hol = sum(1 for r in rede_rows_hol if r["_exec"] == "NÃO")
         st.markdown(
-            f"**Véspera {eve_date.strftime('%d/%m')}:** {n_sim_eve} SIM · {n_nao_eve} NÃO  \n"
-            f"**Feriado {holiday_date.strftime('%d/%m')}:** {n_sim_hol} SIM · {n_nao_hol} NÃO  \n"
+            f"**Véspera {eve_date.strftime('%d/%m')} ({_pt_days[eve_dow]}):** {n_sim_eve} SIM · {n_nao_eve} NÃO  \n"
+            f"**Feriado {holiday_date.strftime('%d/%m')} ({_pt_days[hol_dow]}):** {n_sim_hol} SIM · {n_nao_hol} NÃO  \n"
             f"Ficheiro: `{fname_xl}`"
         )
 
