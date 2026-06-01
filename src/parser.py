@@ -578,6 +578,228 @@ def parse_network_xlsm(file) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Proposta de alteração parser
+# ---------------------------------------------------------------------------
+
+def _parse_carreiras_futuro_block(ws) -> tuple[str, list[dict]]:
+    """Parse the FUTURO block (cols L–T) of the Carreiras sheet.
+
+    The macro (Ctrl+E / exec_base) creates the Carreiras sheet with:
+      - Row 0: "ATUAL" header | "FUTURO a iniciar em DD/MM" header
+      - Blocks of 20 rows each for every route:
+          Row +0: "Carreira"      | carreira_id      (col L=label, M=value)
+          Row +1: "Designação"    | designacao
+          Row +2: "Periodicidade" | periodicidade
+          Row +3: "Transportador" | transportador
+          Row +4: "Viatura"       | viatura
+          Row +5: column headers (Código, Designação, N.ºPar, HPC, HPP, TP, TT, Km, VM, ...)
+          Rows +6 to +17: stop data rows
+          Row +18: totals row
+
+    FUTURO column layout (0-indexed):
+        L=11  label / stop code
+        M=12  value / stop name
+        N=13  N.ºPar
+        O=14  HPC  (new arrival time — user-edited)
+        P=15  HPP  (new departure time — user-edited)
+        Q=16  TP
+        R=17  TT
+        S=18  Km
+        T=19  VM
+        U=20  Dif.Hora  (formula — ignored)
+        V=21  Pausa     (formula — ignored)
+
+    Returns (effective_date, routes_list).
+    """
+    # Column offsets for FUTURO block
+    C_LABEL = 11  # L
+    C_VALUE = 12  # M
+    C_NPAR  = 13  # N
+    C_HPC   = 14  # O
+    C_HPP   = 15  # P
+    C_TP    = 16  # Q
+    C_TT    = 17  # R
+    C_KM    = 18  # S
+    C_VM    = 19  # T
+
+    effective_date = ""
+    routes: list[dict] = []
+
+    all_rows = list(ws.iter_rows(values_only=True))
+    if not all_rows:
+        return effective_date, routes
+
+    # Extract effective date from row 0 — look for a cell with "iniciar" or "futuro"
+    for cell in all_rows[0]:
+        if cell and isinstance(cell, str):
+            low = cell.lower()
+            if "iniciar" in low or "futuro" in low:
+                m = re.search(r"\d{1,2}/\d{2}(?:/\d{2,4})?", cell)
+                if m:
+                    effective_date = m.group(0)
+                break
+
+    current: Optional[dict] = None
+
+    def _pad(row, n):
+        row = list(row)
+        while len(row) < n:
+            row.append(None)
+        return row
+
+    for row_raw in all_rows:
+        row = _pad(row_raw, C_VM + 1)
+
+        label = str(row[C_LABEL] or "").strip()
+
+        if label == "Carreira":
+            # Flush previous route
+            if current and current.get("stops"):
+                current["stops"] = _fix_overnight(current["stops"])
+                routes.append(current)
+
+            try:
+                car = int(float(str(row[C_VALUE]))) if row[C_VALUE] is not None else None
+            except (ValueError, TypeError):
+                car = None
+            if car is None:
+                current = None
+                continue
+
+            current = {
+                "carreira":      car,
+                "designacao":    None,
+                "periodicidade": None,
+                "transportador": None,
+                "veiculo":       None,
+                "rede":          "",
+                "regiao":        "",
+                "origem":        "",
+                "destino":       "",
+                "stops":         [],
+            }
+            continue
+
+        if current is None:
+            continue
+
+        if label == "Designação":
+            current["designacao"] = str(row[C_VALUE] or "").strip()
+        elif label == "Periodicidade":
+            current["periodicidade"] = str(row[C_VALUE] or "").strip()
+        elif label == "Transportador":
+            current["transportador"] = str(row[C_VALUE] or "").strip()
+        elif label == "Viatura":
+            current["veiculo"] = str(row[C_VALUE] or "").strip()
+        elif label in ("Código", "Codigo"):
+            continue  # column header row
+        elif label == "" and all(row[C_LABEL + i] is None for i in range(9)):
+            # Empty row — block separator; flush
+            if current and current.get("stops"):
+                current["stops"] = _fix_overnight(current["stops"])
+                routes.append(current)
+            current = None
+        else:
+            # Stop data row: col L = stop code (numeric)
+            try:
+                int(float(str(row[C_LABEL])))
+            except (ValueError, TypeError):
+                continue  # not a data row
+
+            stop_name = str(row[C_VALUE] or "").strip()
+            try:
+                n_par = int(row[C_NPAR]) if row[C_NPAR] is not None else None
+            except (ValueError, TypeError):
+                n_par = None
+
+            hpc = _time_to_minutes(row[C_HPC])
+            hpp = _time_to_minutes(row[C_HPP])
+
+            def _sf(v):
+                try:
+                    return float(v) if v is not None else None
+                except (ValueError, TypeError):
+                    return None
+
+            current["stops"].append({
+                "paragem": stop_name,
+                "n_par":   n_par,
+                "hpc":     hpc,
+                "hpp":     hpp,
+                "tp":      _sf(row[C_TP]),
+                "tt":      _sf(row[C_TT]),
+                "km":      _sf(row[C_KM]),
+                "tipo":    "",
+            })
+
+    # Flush last route
+    if current and current.get("stops"):
+        current["stops"] = _fix_overnight(current["stops"])
+        routes.append(current)
+
+    # Set origem/destino from first/last stop
+    for r in routes:
+        if r["stops"]:
+            r["origem"]  = r["stops"][0]["paragem"]
+            r["destino"] = r["stops"][-1]["paragem"]
+
+    return effective_date, routes
+
+
+def parse_alteracao_xlsm(file) -> dict:
+    """Parse a 'Proposta de alteração' xlsm file.
+
+    Reads the **FUTURO block** (cols L–T) of the Carreiras sheet, which is
+    populated by the Ctrl+E macro from the Horários data and then manually
+    edited by the user to set the new HPC/HPP times.
+
+    Returns
+    -------
+    dict:
+        routes         : list of updated route dicts (FUTURO schedule)
+        effective_date : str date extracted from Carreiras header (e.g. "13/04")
+    """
+    try:
+        if hasattr(file, "read"):
+            raw = file.read()
+        else:
+            with open(file, "rb") as fh:
+                raw = fh.read()
+        wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+    except Exception as exc:
+        logger.error("Failed to open alteracao file: %s", exc)
+        raise
+
+    sheetnames = wb.sheetnames
+    logger.info("Proposta sheets: %s", sheetnames)
+
+    if "Carreiras" not in sheetnames:
+        raise ValueError(
+            f"Folha 'Carreiras' não encontrada na proposta. "
+            f"Folhas disponíveis: {list(sheetnames)}"
+        )
+
+    effective_date, routes = _parse_carreiras_futuro_block(wb["Carreiras"])
+
+    # Tag reverse logistics
+    for route in routes:
+        route["is_reverse_logistics"] = detect_reverse_logistics(route)
+        route["reverse_leg_from"] = (
+            find_reverse_leg_from(route) if route["is_reverse_logistics"] else None
+        )
+
+    logger.info(
+        "Proposta parsed: %d routes from Carreiras FUTURO block, effective date: %r",
+        len(routes), effective_date,
+    )
+
+    return {
+        "routes":         routes,
+        "effective_date": effective_date,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Execution file parser
 # ---------------------------------------------------------------------------
 

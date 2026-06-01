@@ -8,6 +8,7 @@ Streamlit application: 3 tabs
 from __future__ import annotations
 
 import io
+import datetime
 import logging
 import math
 from typing import Optional
@@ -22,7 +23,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(__file__))
 
-from src.parser import parse_network_xlsm, parse_execution_file
+from src.parser import parse_network_xlsm, parse_execution_file, parse_alteracao_xlsm
 from src.network import build_dependency_graph, get_downstream, get_upstream
 from src.delays import calculate_cascade, get_initial_delays
 
@@ -149,6 +150,235 @@ def _rebuild_graph(routes: list[dict], window: int, sul_only: bool):
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — Rede Semanal
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def _apply_alteracao(current_routes: list[dict], new_routes: list[dict]) -> tuple[list[dict], int, int]:
+    """Merge new_routes into current_routes by carreira code.
+
+    For existing routes, metadata not present in the proposal (rede, regiao)
+    is preserved from the current network.
+
+    Returns (merged_routes, n_updated, n_added).
+    """
+    current_by_id = {r["carreira"]: r for r in current_routes}
+    n_updated = 0
+    n_added = 0
+
+    for r in new_routes:
+        car = r["carreira"]
+        if car in current_by_id:
+            existing = current_by_id[car]
+            # Preserve network metadata the proposal doesn't carry
+            for field in ("rede", "regiao"):
+                if not r.get(field) and existing.get(field):
+                    r[field] = existing[field]
+            current_by_id[car] = r
+            n_updated += 1
+        else:
+            current_by_id[car] = r
+            n_added += 1
+
+    # Preserve original ordering, then append new ones
+    existing_ids = {r["carreira"] for r in current_routes}
+    merged = [current_by_id[r["carreira"]] for r in current_routes]
+    for r in new_routes:
+        if r["carreira"] not in existing_ids:
+            merged.append(r)
+
+    return merged, n_updated, n_added
+
+
+def tab_alterar_carreiras():
+    """Tab dedicada à aplicação de propostas de alteração de carreiras."""
+    st.header("✏️ Alterar Carreiras")
+
+    routes = _get_state("routes")
+    if not routes:
+        st.info("⬆️ Carregue primeiro o ficheiro de rede base (Tab Rede Semanal).")
+        return
+
+    alteracoes_aplicadas = _get_state("alteracoes_aplicadas", [])
+
+    # ── Estado atual da rede ─────────────────────────────────────────────────
+    col_info1, col_info2, col_info3 = st.columns(3)
+    with col_info1:
+        st.metric("Carreiras na rede", len(routes))
+    with col_info2:
+        st.metric("Propostas aplicadas", len(alteracoes_aplicadas))
+    with col_info3:
+        original = _get_state("routes_original")
+        if original:
+            st.metric("Carreiras originais", len(original))
+
+    # ── Histórico de propostas aplicadas ─────────────────────────────────────
+    if alteracoes_aplicadas:
+        st.markdown("### Propostas já aplicadas")
+        for i, entry in enumerate(alteracoes_aplicadas):
+            st.markdown(
+                f"**{i+1}.** `{entry['filename']}` — "
+                f"🔄 {entry['n_updated']} alterada(s)"
+                + (f", ➕ {entry['n_added']} nova(s)" if entry.get("n_added") else "")
+                + (f" · vigência: **{entry['effective_date']}**" if entry.get("effective_date") else "")
+            )
+
+        col_reset, _ = st.columns([1, 3])
+        with col_reset:
+            if st.button("↩️ Repor rede original", key="btn_reset_alteracao", type="secondary"):
+                if original:
+                    _set_state("routes", original)
+                    _set_state("alteracoes_aplicadas", [])
+                    window   = _get_state("connection_window", 90)
+                    sul_only = _get_state("sul_only", False)
+                    _rebuild_graph(original, window, sul_only)
+                    st.success("Rede original reposta.")
+                    st.rerun()
+
+        st.markdown("---")
+
+    # ── Instruções de uso ─────────────────────────────────────────────────────
+    with st.expander("ℹ️ Como usar este processo", expanded=not alteracoes_aplicadas):
+        st.markdown(
+            """
+1. No ficheiro `.xlsm` de proposta, cole as carreiras a alterar na folha **Horários** (mesmo formato da rede base)
+2. Execute a macro **Ctrl+E** — a folha **Carreiras** será preenchida com ATUAL e FUTURO lado a lado
+3. Edite os novos horários na coluna FUTURO (HPC/HPP) da folha Carreiras
+4. Guarde o ficheiro e carregue-o aqui
+5. A app lê o bloco FUTURO, mostra as diferenças e aplica as alterações à rede carregada
+            """
+        )
+
+    # ── Upload da proposta ────────────────────────────────────────────────────
+    st.markdown("### Carregar proposta de alteração")
+    uploaded_prop = st.file_uploader(
+        "Ficheiro de proposta (.xlsm) — folha Carreiras preenchida pela macro Ctrl+E",
+        type=["xlsm", "xlsx"],
+        key="alteracao_uploader",
+    )
+
+    if uploaded_prop is None:
+        return
+
+    with st.spinner("A processar proposta…"):
+        try:
+            raw_prop = uploaded_prop.read()
+            import src.parser as _pm
+            import importlib
+            importlib.reload(_pm)
+            from src.parser import parse_alteracao_xlsm as _parse_alt
+            alt_data = _parse_alt(io.BytesIO(raw_prop))
+            new_routes    = alt_data["routes"]
+            effective_date = alt_data.get("effective_date", "")
+        except Exception as exc:
+            st.error(f"Erro ao processar proposta: {exc}")
+            logger.exception("Proposta parse error")
+            return
+
+    if not new_routes:
+        st.warning(
+            "Nenhuma carreira encontrada no bloco FUTURO da folha Carreiras. "
+            "Confirme que executou a macro Ctrl+E e guardou o ficheiro antes de carregar."
+        )
+        return
+
+    # ── Diff preview ──────────────────────────────────────────────────────────
+    current_by_id = {r["carreira"]: r for r in routes}
+    rows_diff = []
+    for r in new_routes:
+        car      = r["carreira"]
+        existing = current_by_id.get(car)
+        estado   = "🔄 Substituição" if existing else "➕ Nova"
+
+        # Compute schedule differences for known routes
+        changed_times = 0
+        if existing:
+            net_stops = existing.get("stops", [])
+            fut_stops = r.get("stops", [])
+            for i, (ns, fs) in enumerate(zip(net_stops, fut_stops)):
+                if ns.get("hpc") != fs.get("hpc") or ns.get("hpp") != fs.get("hpp"):
+                    changed_times += 1
+
+        rows_diff.append({
+            "Carreira":           car,
+            "Designação (futuro)": r.get("designacao", ""),
+            "Estado":             estado,
+            "N.º paragens":       len(r.get("stops", [])),
+            "Paragens (atual)":   len(existing.get("stops", [])) if existing else "—",
+            "Horários alterados": changed_times if existing else "—",
+        })
+
+    st.markdown(f"### Proposta: `{uploaded_prop.name}`" + (f"  ·  vigência: **{effective_date}**" if effective_date else ""))
+
+    n_update = sum(1 for r in new_routes if r["carreira"] in current_by_id)
+    n_add    = len(new_routes) - n_update
+    col_m1, col_m2, col_m3 = st.columns(3)
+    col_m1.metric("Carreiras a substituir", n_update)
+    col_m2.metric("Carreiras novas", n_add)
+    col_m3.metric("Total na proposta", len(new_routes))
+
+    st.dataframe(
+        pd.DataFrame(rows_diff),
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "Horários alterados": st.column_config.NumberColumn("Horários alterados", help="N.º de paragens com HPC ou HPP diferente"),
+        },
+    )
+
+    # ── Detalhe por carreira ──────────────────────────────────────────────────
+    cars_with_diff = [r for r in new_routes if r["carreira"] in current_by_id
+                      and any(ns.get("hpc") != fs.get("hpc") or ns.get("hpp") != fs.get("hpp")
+                              for ns, fs in zip(current_by_id[r["carreira"]].get("stops", []),
+                                                r.get("stops", [])))]
+    if cars_with_diff:
+        with st.expander(f"🔎 Detalhe de horários alterados ({len(cars_with_diff)} carreira(s))"):
+            for r in cars_with_diff:
+                car      = r["carreira"]
+                existing = current_by_id[car]
+                st.markdown(f"**{car} — {r.get('designacao','')}**")
+                detail_rows = []
+                for i, (ns, fs) in enumerate(zip(existing.get("stops", []), r.get("stops", []))):
+                    hpc_a = ns.get("hpc"); hpc_f = fs.get("hpc")
+                    hpp_a = ns.get("hpp"); hpp_f = fs.get("hpp")
+                    def fmt(v):
+                        if v is None: return "—"
+                        return f"{(v%1440)//60:02d}:{(v%1440)%60:02d}"
+                    changed = (hpc_a != hpc_f or hpp_a != hpp_f)
+                    detail_rows.append({
+                        "Par.": i + 1,
+                        "Paragem": ns.get("paragem", ""),
+                        "HPC atual": fmt(hpc_a), "HPC futuro": fmt(hpc_f),
+                        "HPP atual": fmt(hpp_a), "HPP futuro": fmt(hpp_f),
+                        "Δ": "🔄" if changed else "✓",
+                    })
+                st.dataframe(pd.DataFrame(detail_rows), hide_index=True, use_container_width=True)
+
+    # ── Aplicar ───────────────────────────────────────────────────────────────
+    st.markdown("---")
+    if st.button("✅ Aplicar proposta à rede", key="btn_apply_alteracao", type="primary"):
+        if not alteracoes_aplicadas:
+            _set_state("routes_original", routes)
+
+        merged, n_updated, n_added = _apply_alteracao(routes, new_routes)
+        _set_state("routes", merged)
+
+        history = list(alteracoes_aplicadas)
+        history.append({
+            "filename":       uploaded_prop.name,
+            "effective_date": effective_date,
+            "n_updated":      n_updated,
+            "n_added":        n_added,
+        })
+        _set_state("alteracoes_aplicadas", history)
+
+        window   = _get_state("connection_window", 90)
+        sul_only = _get_state("sul_only", False)
+        _rebuild_graph(merged, window, sul_only)
+
+        st.success(
+            f"✅ Proposta aplicada: {n_updated} carreira(s) alterada(s)"
+            + (f", {n_added} adicionada(s)" if n_added else "")
+            + (f" · vigência: {effective_date}" if effective_date else "")
+        )
+        st.rerun()
 
 _NETWORK_FILE_PATH = os.path.join(os.path.dirname(__file__), "data", "rede_atual.xlsm")
 _NETWORK_META_PATH = os.path.join(os.path.dirname(__file__), "data", "rede_meta.txt")
@@ -2439,34 +2669,1448 @@ def tab_ocupacao_grupagem():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# TAB 6 — Gerar Pauta Drivian
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_DRIVIAN_COLS = [
+    "Carreira", "Trajeto", "Ponto", "Ligação", "Viatura", "Ocupação",
+    "Rede", "C/P", "Dia", "Previsto", "Real", "Atrelado", "Ocupação Atrelados",
+    "Atraso", "Anomalia", "Causa", "Responsabilidade", "Designação Paragem",
+    "TP/RE", "Ordem", "Real APL", "Real Telemetria", "Obs.", "Transportador",
+    "Volume", "Disp/Conc", "início - intermédia", "mesmo dia - passa dia",
+    "data de início", "Sub Rede",
+]
+
+_HUB_KEYWORDS = [
+    "marl", "co s ", "co n ", "co pal", "co ben", "co ev", "co alg",
+    "cpl-s", "cpl-n", "cdp", "cpls", "cpln",
+]
+
+
+def _is_hub(name: str) -> bool:
+    low = (name or "").lower()
+    return any(k in low for k in _HUB_KEYWORDS)
+
+
+def _extract_volume(veiculo: str) -> Optional[int]:
+    """'23m3' → 23,  '45 M3' → 45, None if unparseable."""
+    if not veiculo:
+        return None
+    import re as _re
+    m = _re.search(r"(\d+)", str(veiculo))
+    return int(m.group(1)) if m else None
+
+
+def _minutes_to_time_date(
+    minutes: int, base_date: datetime.date
+) -> tuple[datetime.time, datetime.date]:
+    extra_days = minutes // 1440
+    mins_in_day = minutes % 1440
+    t = datetime.time(mins_in_day // 60, mins_in_day % 60)
+    d = base_date + datetime.timedelta(days=extra_days)
+    return t, d
+
+
+def _route_to_drivian_rows(
+    route: dict,
+    base_date: datetime.date,
+    disp_conc_override: str = "",
+    sub_rede_override: str = "",
+) -> list[dict]:
+    """Convert one route dict to a list of Drivian import rows."""
+    car       = route["carreira"]
+    desig     = route.get("designacao") or ""
+    rede      = route.get("rede") or ""
+    regiao    = route.get("regiao") or ""
+    transp    = route.get("transportador") or ""
+    veiculo   = route.get("veiculo") or ""
+    stops     = route.get("stops", [])
+
+    if not stops:
+        return []
+
+    vol = _extract_volume(veiculo)
+
+    # Re-apply overnight monotonicity fix to ALL stops (including first stop,
+    # which _fix_overnight skips).  We work on copies to avoid mutating cache.
+    fixed_times: list[tuple[Optional[int], Optional[int]]] = []
+    last_t = 0
+    for stop in stops:
+        hpc = stop.get("hpc")
+        hpp = stop.get("hpp")
+        if hpc is not None and hpc < last_t - 30:
+            hpc += 1440
+        if hpc is not None:
+            last_t = hpc
+        if hpp is not None and hpp < last_t - 30:
+            hpp += 1440
+        if hpp is not None:
+            last_t = hpp
+        fixed_times.append((hpc, hpp))
+
+    # Disp/Conc heuristic: last stop = hub → collecting (Concentração)
+    destino = route.get("destino") or (stops[-1].get("paragem") or "")
+    origem  = route.get("origem")  or (stops[0].get("paragem")  or "")
+    if disp_conc_override:
+        disp_conc = disp_conc_override
+    elif _is_hub(destino) and not _is_hub(origem):
+        disp_conc = "Concentração/Asc"
+    elif _is_hub(origem) and not _is_hub(destino):
+        disp_conc = "Dispersão/Desc"
+    else:
+        disp_conc = "Concentração/Asc"
+
+    # Sub Rede
+    sub_rede = sub_rede_override or (f"{rede} Exp" if rede else "")
+
+    # Determine whether route crosses midnight (passes day)
+    all_minutes = [v for pair in fixed_times for v in pair if v is not None]
+    passa_dia = any(m >= 1440 for m in all_minutes)
+    mesmo_dia_label = "passa dia" if passa_dia else "mesmo dia"
+
+    base_dt = datetime.datetime.combine(base_date, datetime.time(0, 0))
+
+    rows: list[dict] = []
+    ordem = 1
+    first_row = True
+
+    for stop, (hpc, hpp) in zip(stops, fixed_times):
+        paragem = stop.get("paragem") or ""
+
+        ini_label = "início" if first_row else "intermédia"
+
+        for cp, minutes in [("C", hpc), ("P", hpp)]:
+            if minutes is None:
+                continue
+
+            t, d = _minutes_to_time_date(minutes, base_date)
+
+            rows.append({
+                "Carreira":              car,
+                "Trajeto":               1,
+                "Ponto":                 None,
+                "Ligação":               desig,
+                "Viatura":               veiculo or None,
+                "Ocupação":              None,
+                "Rede":                  rede,
+                "C/P":                   cp,
+                "Dia":                   datetime.datetime.combine(d, datetime.time(0, 0)),
+                "Previsto":              t,
+                "Real":                  None,
+                "Atrelado":              None,
+                "Ocupação Atrelados":    None,
+                "Atraso":                None,
+                "Anomalia":              None,
+                "Causa":                 None,
+                "Responsabilidade":      None,
+                "Designação Paragem":    paragem,
+                "TP/RE":                 regiao,
+                "Ordem":                 ordem,
+                "Real APL":              None,
+                "Real Telemetria":       None,
+                "Obs.":                  None,
+                "Transportador":         transp,
+                "Volume":                vol,
+                "Disp/Conc":             disp_conc,
+                "início - intermédia":   ini_label,
+                "mesmo dia - passa dia": mesmo_dia_label,
+                "data de início":        base_dt,
+                "Sub Rede":              sub_rede,
+            })
+            ordem += 1
+            ini_label = "intermédia"
+            first_row = False
+
+    return rows
+
+
+def _build_drivian_xlsx(rows: list[dict]) -> bytes:
+    """Serialise Drivian rows to an .xlsx bytes buffer."""
+    import openpyxl as _opx
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    wb = _opx.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+
+    # Header row
+    for col_idx, col_name in enumerate(_DRIVIAN_COLS, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=col_name)
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill("solid", fgColor="DDEBF7")
+
+    # Data rows
+    for row_idx, row in enumerate(rows, start=2):
+        for col_idx, col_name in enumerate(_DRIVIAN_COLS, start=1):
+            val = row.get(col_name)
+            ws.cell(row=row_idx, column=col_idx, value=val)
+
+    # Auto-width (rough)
+    for col_idx, col_name in enumerate(_DRIVIAN_COLS, start=1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = max(12, len(col_name) + 2)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _parse_drivian_file(uploaded) -> pd.DataFrame:
+    raw = uploaded.read()
+    import openpyxl as _opx
+    wb = _opx.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+    ws = wb.active
+    all_rows = list(ws.iter_rows(values_only=True))
+    if not all_rows:
+        return pd.DataFrame()
+    headers = [str(c or "").strip() for c in all_rows[0]]
+    data = [dict(zip(headers, r)) for r in all_rows[1:]]
+    return pd.DataFrame(data)
+
+
+def _find_corrections(drivian_df: pd.DataFrame, routes_dict: dict) -> pd.DataFrame:
+    """Compare uploaded Drivian file against network routes; return correction table."""
+    import re as _re
+
+    corrections = []
+
+    if "Carreira" not in drivian_df.columns:
+        return pd.DataFrame()
+
+    for car_raw, grp in drivian_df.groupby("Carreira"):
+        try:
+            car = int(float(str(car_raw)))
+        except (ValueError, TypeError):
+            continue
+
+        route = routes_dict.get(car)
+        if route is None:
+            corrections.append({
+                "Carreira":    car,
+                "Ligação":     grp.iloc[0].get("Ligação", ""),
+                "Problema":    "⚠️ Carreira não encontrada na rede carregada",
+                "Campo":       "—",
+                "Valor atual": "—",
+                "Sugestão":    "—",
+            })
+            continue
+
+        route_stops = route.get("stops", [])
+
+        # Check Ligação vs designacao
+        desig_net = (route.get("designacao") or "").strip()
+        desig_drv = str(grp.iloc[0].get("Ligação") or "").strip()
+        if desig_net and desig_drv and desig_net != desig_drv:
+            corrections.append({
+                "Carreira":    car,
+                "Ligação":     desig_drv,
+                "Problema":    "🔄 Designação diferente da rede",
+                "Campo":       "Ligação",
+                "Valor atual": desig_drv,
+                "Sugestão":    desig_net,
+            })
+
+        # Check Viatura empty
+        viaturas = grp["Viatura"].dropna() if "Viatura" in grp.columns else pd.Series()
+        if viaturas.empty and route.get("veiculo"):
+            corrections.append({
+                "Carreira":    car,
+                "Ligação":     desig_drv,
+                "Problema":    "❌ Viatura em falta",
+                "Campo":       "Viatura",
+                "Valor atual": "",
+                "Sugestão":    route["veiculo"],
+            })
+
+        # Check Volume empty
+        vols = grp["Volume"].dropna() if "Volume" in grp.columns else pd.Series()
+        vol_sug = _extract_volume(route.get("veiculo") or "")
+        if vols.empty and vol_sug is not None:
+            corrections.append({
+                "Carreira":    car,
+                "Ligação":     desig_drv,
+                "Problema":    "❌ Volume em falta",
+                "Campo":       "Volume",
+                "Valor atual": "",
+                "Sugestão":    str(vol_sug),
+            })
+
+        # Check stop count
+        drv_stops = grp[grp["C/P"] == "C"] if "C/P" in grp.columns else grp
+        n_drv = len(drv_stops)
+        n_net = len(route_stops)
+        if n_net > 0 and n_drv != n_net:
+            corrections.append({
+                "Carreira":    car,
+                "Ligação":     desig_drv,
+                "Problema":    "⚠️ Número de paragens diferente",
+                "Campo":       "Paragens",
+                "Valor atual": str(n_drv),
+                "Sugestão":    str(n_net),
+            })
+
+        # Check Previsto times vs network hpc/hpp
+        if "C/P" in grp.columns and "Previsto" in grp.columns:
+            c_rows = grp[grp["C/P"] == "C"].reset_index(drop=True)
+            p_rows = grp[grp["C/P"] == "P"].reset_index(drop=True)
+
+            for i, stop in enumerate(route_stops):
+                # arrival
+                if i < len(c_rows):
+                    prev_drv = c_rows.iloc[i]["Previsto"]
+                    hpc_net  = stop.get("hpc")
+                    if hpc_net is not None and prev_drv is not None:
+                        try:
+                            if hasattr(prev_drv, "hour"):
+                                drv_min = prev_drv.hour * 60 + prev_drv.minute
+                            else:
+                                drv_min = None
+                            if drv_min is not None and abs(drv_min - (hpc_net % 1440)) > 0:
+                                net_t = f"{(hpc_net%1440)//60:02d}:{(hpc_net%1440)%60:02d}"
+                                drv_t = f"{prev_drv.hour:02d}:{prev_drv.minute:02d}" if hasattr(prev_drv, "hour") else str(prev_drv)
+                                corrections.append({
+                                    "Carreira":    car,
+                                    "Ligação":     desig_drv,
+                                    "Problema":    f"🕐 HPC diferente — paragem {i+1} ({stop.get('paragem','')})",
+                                    "Campo":       "Previsto (C)",
+                                    "Valor atual": drv_t,
+                                    "Sugestão":    net_t,
+                                })
+                        except Exception:
+                            pass
+                # departure
+                if i < len(p_rows):
+                    prev_drv = p_rows.iloc[i]["Previsto"]
+                    hpp_net  = stop.get("hpp")
+                    if hpp_net is not None and prev_drv is not None:
+                        try:
+                            if hasattr(prev_drv, "hour"):
+                                drv_min = prev_drv.hour * 60 + prev_drv.minute
+                            else:
+                                drv_min = None
+                            if drv_min is not None and abs(drv_min - (hpp_net % 1440)) > 0:
+                                net_t = f"{(hpp_net%1440)//60:02d}:{(hpp_net%1440)%60:02d}"
+                                drv_t = f"{prev_drv.hour:02d}:{prev_drv.minute:02d}" if hasattr(prev_drv, "hour") else str(prev_drv)
+                                corrections.append({
+                                    "Carreira":    car,
+                                    "Ligação":     desig_drv,
+                                    "Problema":    f"🕐 HPP diferente — paragem {i+1} ({stop.get('paragem','')})",
+                                    "Campo":       "Previsto (P)",
+                                    "Valor atual": drv_t,
+                                    "Sugestão":    net_t,
+                                })
+                        except Exception:
+                            pass
+
+    return pd.DataFrame(corrections) if corrections else pd.DataFrame(
+        columns=["Carreira", "Ligação", "Problema", "Campo", "Valor atual", "Sugestão"]
+    )
+
+
+def _drivian_filter_controls(routes, key_prefix: str):
+    """Shared filter controls for Drivian generation. Returns filtered routes + generation params."""
+    col_date, col_rede, col_reg, col_transp = st.columns(4)
+    with col_date:
+        pauta_date = st.date_input("Data da pauta", value=datetime.date.today(), key=f"{key_prefix}_date")
+    with col_rede:
+        rede_opts = sorted({r.get("rede", "") for r in routes if r.get("rede")})
+        sel_rede = st.multiselect("Rede", rede_opts, default=rede_opts, key=f"{key_prefix}_rede")
+    with col_reg:
+        reg_opts = sorted({r.get("regiao", "") for r in routes if r.get("regiao")})
+        sel_reg = st.multiselect("Região", reg_opts, default=[], key=f"{key_prefix}_reg",
+                                 placeholder="(todas)")
+    with col_transp:
+        tr_opts = ["(todos)"] + sorted({r.get("transportador", "") for r in routes if r.get("transportador")})
+        sel_tr = st.selectbox("Transportador", tr_opts, key=f"{key_prefix}_transp")
+
+    col_dc, col_sr = st.columns(2)
+    with col_dc:
+        disp_conc_mode = st.selectbox(
+            "Disp/Conc",
+            ["Automático (heurística hub)", "Concentração/Asc", "Dispersão/Desc"],
+            key=f"{key_prefix}_dc",
+        )
+    with col_sr:
+        sub_rede_override = st.text_input(
+            "Sub Rede (vazio = automático)",
+            key=f"{key_prefix}_sr",
+            placeholder="ex: R3 Exp Clientes",
+        )
+
+    filtered = [
+        r for r in routes
+        if (not sel_rede or r.get("rede", "") in sel_rede)
+        and (not sel_reg or r.get("regiao", "") in sel_reg)
+        and (sel_tr == "(todos)" or r.get("transportador", "") == sel_tr)
+    ]
+    dc = "" if disp_conc_mode.startswith("Automático") else disp_conc_mode
+    return filtered, pauta_date, dc, sub_rede_override
+
+
+def tab_gerar_pauta_drivian():
+    """Tab: gerar pauta Drivian de raiz a partir da rede carregada."""
+    st.header("📤 Gerar Pauta Drivian")
+    st.caption("Gera ficheiro .xlsx no formato de importação do Drivian (importType=8) a partir das carreiras da rede carregada.")
+
+    routes = _get_state("routes")
+    if not routes:
+        st.info("⬆️ Carregue primeiro o ficheiro de rede (Tab Rede Semanal).")
+        return
+
+    filtered, pauta_date, dc, sub_rede = _drivian_filter_controls(routes, "gen")
+    st.caption(f"{len(filtered)} carreira(s) seleccionadas")
+
+    if not filtered:
+        st.warning("Nenhuma carreira corresponde aos filtros.")
+        return
+
+    with st.expander("👁️ Pré-visualizar primeiras 5 carreiras", expanded=False):
+        preview_rows: list[dict] = []
+        for r in filtered[:5]:
+            preview_rows += _route_to_drivian_rows(r, pauta_date, dc, sub_rede)
+        if preview_rows:
+            st.dataframe(pd.DataFrame(preview_rows)[_DRIVIAN_COLS[:15]], hide_index=True, use_container_width=True)
+
+    if st.button("⚙️ Gerar ficheiro Drivian", type="primary", key="btn_gen_drivian"):
+        with st.spinner("A gerar…"):
+            all_rows: list[dict] = []
+            for r in filtered:
+                all_rows += _route_to_drivian_rows(r, pauta_date, dc, sub_rede)
+
+        if not all_rows:
+            st.warning("Nenhuma linha gerada.")
+            return
+
+        xlsx_bytes = _build_drivian_xlsx(all_rows)
+        fname = f"Pauta_Drivian_{pauta_date.strftime('%Y%m%d')}.xlsx"
+        st.success(f"✅ {len(all_rows)} linhas · {len(filtered)} carreira(s)")
+        st.download_button(
+            label=f"⬇️ Descarregar {fname}",
+            data=xlsx_bytes,
+            file_name=fname,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="btn_download_drivian",
+        )
+
+
+def _build_exec_lookup(exec_df: pd.DataFrame) -> dict:
+    """Build lookup dict from execution data: (carreira, cp, dia_date, ordem) → row dict.
+
+    Also builds a secondary key without Ordem for cases where order differs:
+    (carreira, cp, dia_date, paragem) → row dict.
+    """
+    lookup_by_ordem: dict = {}
+    lookup_by_paragem: dict = {}
+
+    def _to_date(v):
+        if v is None:
+            return None
+        if hasattr(v, "date"):
+            return v.date()
+        if isinstance(v, str):
+            try:
+                return pd.to_datetime(v).date()
+            except Exception:
+                return None
+        return None
+
+    for _, row in exec_df.iterrows():
+        try:
+            car = int(float(str(row.get("carreira") or "")))
+        except (ValueError, TypeError):
+            continue
+        cp  = str(row.get("cp") or "").strip().upper()
+        dia = _to_date(row.get("dia"))
+        if not cp or dia is None:
+            continue
+
+        try:
+            ordem = int(float(str(row.get("ordem") or "")))
+        except (ValueError, TypeError):
+            ordem = None
+
+        paragem = str(row.get("designacao_paragem") or "").strip().lower()
+
+        row_dict = row.to_dict()
+        if ordem is not None:
+            lookup_by_ordem[(car, cp, dia, ordem)] = row_dict
+        if paragem:
+            lookup_by_paragem[(car, cp, dia, paragem)] = row_dict
+
+    return {"by_ordem": lookup_by_ordem, "by_paragem": lookup_by_paragem}
+
+
+def _fill_drivian_from_exec(drv_df: pd.DataFrame, lookup: dict) -> tuple[pd.DataFrame, dict]:
+    """Fill empty execution fields in Drivian df from exec lookup.
+
+    Returns (filled_df, stats dict).
+    """
+    import datetime as _dt
+
+    by_ordem   = lookup["by_ordem"]
+    by_paragem = lookup["by_paragem"]
+
+    # Fields to fill: (drivian_col, exec_col)
+    FILL_MAP = [
+        ("Real",             "real"),
+        ("Viatura",          "viatura"),
+        ("Ocupação",         "ocupacao"),
+        ("Atraso",           "atraso_min"),
+        ("Anomalia",         "anomalia"),
+        ("Causa",            "causa"),
+        ("Responsabilidade", "responsabilidade"),
+        ("Real APL",         "real_apl"),
+        ("Real Telemetria",  "real_telemetria"),
+        ("Obs.",             "obs"),
+    ]
+
+    df = drv_df.copy()
+    stats = {dc: {"filled": 0, "already": 0, "not_found": 0} for dc, _ in FILL_MAP}
+
+    def _to_date(v):
+        if v is None:
+            return None
+        if hasattr(v, "date"):
+            return v.date()
+        if isinstance(v, (str,)):
+            try:
+                return pd.to_datetime(v).date()
+            except Exception:
+                return None
+        return None
+
+    for idx, row in df.iterrows():
+        try:
+            car = int(float(str(row.get("Carreira") or "")))
+        except (ValueError, TypeError):
+            continue
+
+        cp     = str(row.get("C/P") or "").strip().upper()
+        dia    = _to_date(row.get("Dia"))
+        paragem = str(row.get("Designação Paragem") or "").strip().lower()
+
+        try:
+            ordem = int(float(str(row.get("Ordem") or "")))
+        except (ValueError, TypeError):
+            ordem = None
+
+        # Look up exec row
+        exec_row = None
+        if ordem is not None and dia is not None:
+            exec_row = by_ordem.get((car, cp, dia, ordem))
+        if exec_row is None and dia is not None and paragem:
+            exec_row = by_paragem.get((car, cp, dia, paragem))
+
+        for drv_col, exec_col in FILL_MAP:
+            if drv_col not in df.columns:
+                continue
+            current = row.get(drv_col)
+            is_empty = current is None or (isinstance(current, float) and pd.isna(current)) or str(current).strip() == ""
+
+            if not is_empty:
+                stats[drv_col]["already"] += 1
+                continue
+
+            if exec_row is None:
+                stats[drv_col]["not_found"] += 1
+                continue
+
+            val = exec_row.get(exec_col)
+            is_val_empty = val is None or (isinstance(val, float) and pd.isna(val))
+            if not is_val_empty:
+                df.at[idx, drv_col] = val
+                stats[drv_col]["filled"] += 1
+            else:
+                stats[drv_col]["not_found"] += 1
+
+    return df, stats
+
+
+def tab_correcoes_drivian():
+    """Tab: preencher campos em falta no ficheiro Drivian com dados das pautas."""
+    st.header("🔧 Completar Pauta Drivian")
+    st.caption(
+        "Carregue um ficheiro exportado do Drivian com campos em falta "
+        "(Real, Ocupação, Atraso, Anomalia, Causa, Responsabilidade…). "
+        "A app cruza com as pautas carregadas e gera o ficheiro preenchido."
+    )
+
+    # ── Source of execution data ──────────────────────────────────────────────
+    exec_df = _get_state("exec_df")
+
+    st.markdown("### 1. Dados de execução (pautas)")
+
+    if exec_df is not None:
+        exec_rows = exec_df[exec_df["carreira"].notna() & exec_df["cp"].notna()]
+        st.success(
+            f"✅ Pautas já carregadas na Tab 'Análise de Impacto' — "
+            f"**{len(exec_rows)}** registos de execução disponíveis."
+        )
+        use_session = True
+    else:
+        st.info("Sem pautas carregadas na sessão. Pode carregar um ficheiro de pautas abaixo, ou ir à Tab 'Análise de Impacto' primeiro.")
+        use_session = False
+
+    uploaded_exec_here = st.file_uploader(
+        "Ou carregue pautas aqui (CSV / XLS / XLSX)",
+        type=["csv", "xls", "xlsx"],
+        key="corr_exec_upload",
+        help="Opcional se as pautas já estiverem carregadas na Tab 2.",
+    )
+
+    if uploaded_exec_here is not None:
+        with st.spinner("A ler pautas…"):
+            try:
+                exec_df = parse_execution_file(uploaded_exec_here)
+                exec_rows = exec_df[exec_df["carreira"].notna() & exec_df["cp"].notna()]
+                st.success(f"✅ {len(exec_rows)} registos de execução carregados.")
+                use_session = True
+            except Exception as exc:
+                st.error(f"Erro ao ler pautas: {exc}")
+                return
+
+    if not use_session or exec_df is None:
+        st.warning("Carregue as pautas de execução para continuar.")
+        return
+
+    exec_rows = exec_df[exec_df["carreira"].notna() & exec_df["cp"].notna()].copy()
+    if exec_rows.empty:
+        st.warning("As pautas carregadas não têm registos de execução (campos Carreira e C/P em falta).")
+        return
+
+    # ── Upload Drivian template ───────────────────────────────────────────────
+    st.markdown("### 2. Ficheiro Drivian a preencher")
+    uploaded_drv = st.file_uploader(
+        "Ficheiro exportado do Drivian (.xlsx / .xls) — com Previsto preenchido mas Real/Ocupação/etc. vazios",
+        type=["xlsx", "xls"],
+        key="drivian_fill_upload",
+    )
+
+    if uploaded_drv is None:
+        st.info("Carregue o ficheiro Drivian para preencher.")
+        return
+
+    with st.spinner("A ler ficheiro Drivian…"):
+        try:
+            drv_df = _parse_drivian_file(uploaded_drv)
+        except Exception as exc:
+            st.error(f"Erro ao ler ficheiro: {exc}")
+            return
+
+    if drv_df.empty:
+        st.warning("Ficheiro vazio ou sem dados.")
+        return
+
+    n_cars_drv = drv_df["Carreira"].nunique() if "Carreira" in drv_df.columns else 0
+
+    col_m1, col_m2, col_m3 = st.columns(3)
+    col_m1.metric("Linhas no ficheiro Drivian", len(drv_df))
+    col_m2.metric("Carreiras no ficheiro", n_cars_drv)
+    col_m3.metric("Registos de execução", len(exec_rows))
+
+    # ── Fields to fill selection ──────────────────────────────────────────────
+    st.markdown("### 3. Campos a preencher")
+    FILL_FIELDS = ["Real", "Viatura", "Ocupação", "Atraso", "Anomalia", "Causa", "Responsabilidade", "Real APL", "Real Telemetria", "Obs."]
+    sel_fields = st.multiselect(
+        "Campos a preencher",
+        FILL_FIELDS,
+        default=["Real", "Viatura", "Ocupação", "Atraso", "Anomalia", "Causa", "Responsabilidade"],
+        key="corr_fields",
+    )
+
+    # ── Preview of what can be matched ───────────────────────────────────────
+    with st.spinner("A construir índice de cruzamento…"):
+        lookup = _build_exec_lookup(exec_rows)
+
+    n_by_ordem   = len(lookup["by_ordem"])
+    n_by_paragem = len(lookup["by_paragem"])
+    st.caption(f"Índice de cruzamento: {n_by_ordem} chaves por (Carreira+C/P+Dia+Ordem) · {n_by_paragem} por (Carreira+C/P+Dia+Paragem)")
+
+    # ── Fill & stats ──────────────────────────────────────────────────────────
+    st.markdown("### 4. Resultado do preenchimento")
+
+    with st.spinner("A preencher campos…"):
+        filled_df, stats = _fill_drivian_from_exec(drv_df, lookup)
+
+    # Summary table
+    summary_rows = []
+    for field in sel_fields:
+        if field in stats:
+            s = stats[field]
+            total = s["filled"] + s["already"] + s["not_found"]
+            summary_rows.append({
+                "Campo":          field,
+                "✅ Preenchidos":  s["filled"],
+                "🔵 Já tinham valor": s["already"],
+                "❌ Não encontrado": s["not_found"],
+                "Total linhas":   total,
+            })
+
+    if summary_rows:
+        st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
+
+    total_filled = sum(stats.get(f, {}).get("filled", 0) for f in sel_fields)
+    total_missing = sum(stats.get(f, {}).get("not_found", 0) for f in sel_fields)
+
+    if total_filled == 0:
+        st.warning(
+            "Nenhum campo foi preenchido. Verifique se as pautas têm a mesma data e carreiras que o ficheiro Drivian, "
+            "e se os campos Ordem/Paragem coincidem."
+        )
+    else:
+        st.success(f"✅ **{total_filled}** preenchimentos realizados em {len(sel_fields)} campo(s).")
+    if total_missing > 0:
+        st.info(f"ℹ️ {total_missing} campo(s) sem correspondência nas pautas (linha pode não existir nas pautas).")
+
+    # Detailed view of rows still missing
+    EXEC_COL_MAP_INV = {
+        "Real": "real", "Viatura": "viatura", "Ocupação": "ocupacao",
+        "Atraso": "atraso_min", "Anomalia": "anomalia",
+        "Causa": "causa", "Responsabilidade": "responsabilidade",
+    }
+    missing_mask = pd.Series([False] * len(filled_df), index=filled_df.index)
+    for field in sel_fields:
+        if field in filled_df.columns:
+            col_mask = filled_df[field].isna() | (filled_df[field].astype(str).str.strip() == "")
+            missing_mask = missing_mask | col_mask
+
+    n_missing_rows = missing_mask.sum()
+    if n_missing_rows > 0:
+        with st.expander(f"🔍 Ver {n_missing_rows} linhas com campos ainda em falta"):
+            show_cols = ["Carreira", "C/P", "Dia", "Ordem", "Designação Paragem"] + [f for f in sel_fields if f in filled_df.columns]
+            st.dataframe(
+                filled_df[missing_mask][[c for c in show_cols if c in filled_df.columns]],
+                hide_index=True,
+                use_container_width=True,
+            )
+
+    # ── Download ──────────────────────────────────────────────────────────────
+    st.markdown("---")
+
+    # Apply field selection: restore None for fields NOT selected
+    out_df = filled_df.copy()
+    for field in FILL_FIELDS:
+        if field not in sel_fields and field in out_df.columns:
+            out_df[field] = drv_df[field]  # revert to original
+
+    xlsx_out = _build_drivian_xlsx([
+        {col: row.get(col) for col in _DRIVIAN_COLS}
+        for _, row in out_df.iterrows()
+    ])
+
+    fname_out = f"Pauta_Drivian_preenchida_{uploaded_drv.name.replace('.xlsx','').replace('.xls','')}.xlsx"
+    st.download_button(
+        label="⬇️ Descarregar ficheiro preenchido",
+        data=xlsx_out,
+        file_name=fname_out,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="btn_dl_filled",
+        type="primary",
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB — Rede de Feriado
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _feriado_execucao_auto(route: dict, period_dow: int) -> str:
+    """Return 'SIM' or 'NÃO' based on the actual day-of-week (0=Mon … 6=Sun).
+
+    Rules:
+      - RIB (logística inversa) → NÃO always
+      - periodicidade includes the target weekday → SIM
+        (the Apresentação time determines which day the route belongs to;
+         since periodicidade already encodes the day the route *presents*,
+         matching on the actual dow is the correct check)
+      - Otherwise → NÃO
+    """
+    if route.get("is_reverse_logistics", False):
+        return "NÃO"
+    days = _parse_periodicidade(route.get("periodicidade") or "")
+    if period_dow in days:
+        return "SIM"
+    return "NÃO"
+
+
+def _time_str_to_minutes(t_str: Optional[str]) -> Optional[int]:
+    """Convert 'HH:MM' string to minutes since midnight."""
+    if not t_str:
+        return None
+    try:
+        h, m = t_str.strip().split(":")
+        return int(h) * 60 + int(m)
+    except (ValueError, AttributeError):
+        return None
+
+
+def _centro_obs(
+    row: dict,
+    centros_config: list[dict],
+) -> Optional[str]:
+    """Return an observation string if the route arrives at a centro after closing.
+
+    centros_config: list of dicts with keys:
+        name       : str   — substring to match against GE Destino or Designação
+        period     : str   — "eve" | "hol" | "both"
+        close_min  : int   — closing time in minutes since midnight
+        close_label: str   — "HH:MM" for display
+
+    Returns None if no constraint is violated.
+    Returns e.g. "Centro CO PIN fechado às 22:00" if the route's Fim > close_min.
+    """
+    fim_str = row.get("Fim")
+    fim_min = _time_str_to_minutes(fim_str)
+    if fim_min is None:
+        return None
+
+    dest   = (row.get("GE Destino") or "").lower()
+    desig  = (row.get("Designação") or "").lower()
+
+    for cfg in centros_config:
+        name_lower = cfg["name"].lower()
+        if name_lower not in dest and name_lower not in desig:
+            continue
+        # Match: check if fim exceeds closing time
+        close_min = cfg["close_min"]
+        # Handle overnight closing (e.g. close at 02:00 means routes arriving
+        # after midnight but before 02:00 are still ok; routes arriving 02:01+
+        # are blocked). We model: if close_min < 360 (before 06h), it's an
+        # overnight closing → compare directly with fim_min, treating fim
+        # values > 1440 (next day) if needed.
+        if fim_min > close_min:
+            return f"Centro {cfg['name']} fecha às {cfg['close_label']}"
+    return None
+
+
+def _route_rede_row(route: dict, exec_val: str = "", obs: str = "") -> dict:
+    """Build a 'Rede de Feriado' summary row from a Horários-format route dict."""
+    stops = route.get("stops", [])
+
+    def _fmt(v):
+        if v is None:
+            return None
+        h, m = divmod(int(v) % 1440, 60)
+        return f"{h:02d}:{m:02d}"
+
+    # Apresentação = arrival time at first stop (hpc); fallback to departure (hpp)
+    apresentacao_min = stops[0].get("hpc") if stops else None
+    if apresentacao_min is None and stops:
+        apresentacao_min = stops[0].get("hpp")
+    inicio_min = stops[0].get("hpp") if stops else None
+    fim_min    = stops[-1].get("hpc") if stops else None
+
+    # Nr dias from periodicidade
+    days = _parse_periodicidade(route.get("periodicidade") or "")
+    nr_dias = len(days) if days != frozenset(range(7)) else 7
+
+    return {
+        "Carreira":           route.get("carreira"),
+        "Designação":         route.get("designacao", ""),
+        "Rede":               route.get("rede", ""),
+        "Transportador":      (route.get("transportador") or "").strip(),
+        "Periodicidade":      route.get("periodicidade", ""),
+        "Nr dias":            nr_dias,
+        "Veículo":            route.get("veiculo", ""),
+        "Km":                 None,
+        "Apresentação":       _fmt(apresentacao_min),
+        "Inicio":             _fmt(inicio_min),
+        "Fim":                _fmt(fim_min),
+        "GE Origem":          route.get("origem", ""),
+        "GE Destino":         route.get("destino", ""),
+        "_exec":              exec_val,
+        "Observações":        obs,
+        "_rib":               route.get("is_reverse_logistics", False),
+        # Raw minutes for centro-closing comparisons
+        "_apresentacao_min":  apresentacao_min,
+        "_inicio_min":        inicio_min,
+        "_fim_min":           fim_min,
+    }
+
+
+def _build_rede_feriado_excel(
+    rows_eve: list[dict],
+    rows_hol: list[dict],
+    exec_col_eve: str,
+    exec_col_hol: str,
+) -> bytes:
+    """Build Excel in the same format as Rede_Transportes_feriado_*.xlsm."""
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    thin_side = Side(style="thin", color="BDBDBD")
+    thin_brd  = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+    hdr_font  = Font(bold=True, color="FFFFFF")
+    sim_fill  = PatternFill("solid", fgColor="C8E6C9")   # light green
+    nao_fill  = PatternFill("solid", fgColor="FFCDD2")   # light red
+    rib_font  = Font(italic=True, color="9E9E9E")
+    hdr_blue  = PatternFill("solid", fgColor="1565C0")
+    hdr_purp  = PatternFill("solid", fgColor="6A1B9A")
+    center_al = Alignment(horizontal="center", vertical="center")
+
+    BASE_COLS = [
+        "Carreira", "Designação", "Rede", "Transportador", "Periodicidade",
+        "Nr dias", "Veículo", "Km", "Apresentação", "Inicio", "Fim",
+        "GE Origem", "GE Destino",
+    ]
+
+    def _write_rede_sheet(ws, rows: list[dict], exec_col: str, hdr_fill):
+        cols = BASE_COLS + [exec_col, "Observações"]
+        # Header row
+        for c, col in enumerate(cols, 1):
+            cell = ws.cell(row=1, column=c, value=col)
+            cell.font = hdr_font
+            cell.fill = hdr_fill
+            cell.alignment = center_al
+            cell.border = thin_brd
+        # Data rows
+        for r_idx, row in enumerate(rows, 2):
+            vals = [
+                row["Carreira"], row["Designação"], row["Rede"],
+                row["Transportador"], row["Periodicidade"], row["Nr dias"],
+                row["Veículo"], row["Km"], row["Apresentação"],
+                row["Inicio"], row["Fim"], row["GE Origem"], row["GE Destino"],
+                row["_exec"], row["Observações"],
+            ]
+            for c, v in enumerate(vals, 1):
+                cell = ws.cell(row=r_idx, column=c, value=v)
+                cell.border = thin_brd
+                if row.get("_rib"):
+                    cell.font = rib_font
+            # Colour the Execução cell
+            exec_cell = ws.cell(row=r_idx, column=14)
+            if row["_exec"] == "SIM":
+                exec_cell.fill = sim_fill
+            elif row["_exec"] == "NÃO":
+                exec_cell.fill = nao_fill
+        # Column widths
+        widths = [14, 52, 10, 14, 18, 8, 8, 6, 12, 8, 8, 14, 14, 32, 30]
+        for c, w in enumerate(widths, 1):
+            ws.column_dimensions[get_column_letter(c)].width = w
+        ws.freeze_panes = "A2"
+
+    wb = openpyxl.Workbook()
+
+    if rows_eve:
+        ws_eve = wb.active
+        ws_eve.title = "Véspera"
+        _write_rede_sheet(ws_eve, rows_eve, exec_col_eve, hdr_blue)
+    else:
+        wb.active.title = "Véspera"
+
+    if rows_hol:
+        ws_hol = wb.create_sheet("Feriado")
+        _write_rede_sheet(ws_hol, rows_hol, exec_col_hol, hdr_purp)
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
+def _build_holiday_excel(
+    eve_routes: list[dict],
+    holiday_routes: list[dict],
+    eve_label: str = "Véspera",
+    holiday_label: str = "Feriado",
+) -> bytes:
+    """Build an Excel workbook with two sheets: eve night + holiday day networks."""
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    wb = openpyxl.Workbook()
+
+    hdr_font   = Font(bold=True, color="FFFFFF")
+    fill_eve   = PatternFill("solid", fgColor="1565C0")   # dark blue — véspera
+    fill_hol   = PatternFill("solid", fgColor="6A1B9A")   # purple — feriado
+    sub_fill   = PatternFill("solid", fgColor="E3F2FD")
+    thin_side  = Side(style="thin", color="BDBDBD")
+    thin_brd   = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+    center_al  = Alignment(horizontal="center", vertical="center")
+
+    def _hdr(ws, row, col, value, fill):
+        cell = ws.cell(row=row, column=col, value=value)
+        cell.font = hdr_font
+        cell.fill = fill
+        cell.alignment = center_al
+        cell.border = thin_brd
+        return cell
+
+    def _cell(ws, row, col, value):
+        cell = ws.cell(row=row, column=col, value=value)
+        cell.border = thin_brd
+        return cell
+
+    resumo_cols = [
+        "Carreira", "Designação", "Rede", "Região", "Transportador",
+        "Veículo", "Periodicidade", "Origem", "Destino", "N.º Paragens",
+    ]
+
+    def _fmt_min(minutes):
+        if minutes is None:
+            return ""
+        h, m = divmod(int(minutes) % 1440, 60)
+        return f"{h:02d}:{m:02d}"
+
+    stop_cols = ["Código", "Paragem", "N.º Par.", "HPC", "HPP", "TP", "TT", "Km"]
+
+    def _write_resumo(ws, routes, fill):
+        for c, col in enumerate(resumo_cols, 1):
+            _hdr(ws, 1, c, col, fill)
+        for r_idx, route in enumerate(routes, 2):
+            vals = [
+                route.get("carreira"),
+                route.get("designacao", ""),
+                route.get("rede", ""),
+                route.get("regiao", ""),
+                route.get("transportador", ""),
+                route.get("veiculo", ""),
+                route.get("periodicidade", ""),
+                route.get("origem", ""),
+                route.get("destino", ""),
+                len(route.get("stops", [])),
+            ]
+            for c, v in enumerate(vals, 1):
+                _cell(ws, r_idx, c, v)
+        for c in range(1, len(resumo_cols) + 1):
+            ws.column_dimensions[get_column_letter(c)].width = 18
+        ws.freeze_panes = "A2"
+
+    def _write_horarios(ws, routes, fill):
+        current_row = 1
+        for route in routes:
+            for label, key in [
+                ("Carreira", "carreira"), ("Designação", "designacao"),
+                ("Periodicidade", "periodicidade"), ("Transportador", "transportador"),
+                ("Viatura", "veiculo"),
+            ]:
+                cell = ws.cell(row=current_row, column=1, value=label)
+                cell.font = Font(bold=True)
+                ws.cell(row=current_row, column=2, value=route.get(key, ""))
+                current_row += 1
+            for c, col in enumerate(stop_cols, 1):
+                cell = ws.cell(row=current_row, column=c, value=col)
+                cell.font = Font(bold=True)
+                cell.fill = sub_fill
+            current_row += 1
+            for i, stop in enumerate(route.get("stops", []), 1):
+                ws.cell(row=current_row, column=1, value=i)
+                ws.cell(row=current_row, column=2, value=stop.get("paragem", ""))
+                ws.cell(row=current_row, column=3, value=stop.get("n_par"))
+                ws.cell(row=current_row, column=4, value=_fmt_min(stop.get("hpc")))
+                ws.cell(row=current_row, column=5, value=_fmt_min(stop.get("hpp")))
+                ws.cell(row=current_row, column=6, value=stop.get("tp"))
+                ws.cell(row=current_row, column=7, value=stop.get("tt"))
+                ws.cell(row=current_row, column=8, value=stop.get("km"))
+                current_row += 1
+            current_row += 1
+        for c in range(1, len(stop_cols) + 1):
+            ws.column_dimensions[get_column_letter(c)].width = 14
+        ws.column_dimensions["B"].width = 30
+
+    # ── Resumo combinado (first sheet) ────────────────────────────────────────
+    ws_comb = wb.active
+    ws_comb.title = "Resumo Geral"
+    all_unique = {r["carreira"]: r for r in eve_routes + holiday_routes}
+    all_sorted = sorted(all_unique.values(), key=lambda r: r["carreira"])
+    # Add period column
+    eve_ids = {r["carreira"] for r in eve_routes}
+    hol_ids = {r["carreira"] for r in holiday_routes}
+    cols_comb = resumo_cols + ["Período"]
+    for c, col in enumerate(cols_comb, 1):
+        _hdr(ws_comb, 1, c, col, fill_eve)
+    for r_idx, route in enumerate(all_sorted, 2):
+        car = route["carreira"]
+        periods = []
+        if car in eve_ids:
+            periods.append(eve_label)
+        if car in hol_ids:
+            periods.append(holiday_label)
+        vals = [
+            car, route.get("designacao", ""), route.get("rede", ""),
+            route.get("regiao", ""), route.get("transportador", ""),
+            route.get("veiculo", ""), route.get("periodicidade", ""),
+            route.get("origem", ""), route.get("destino", ""),
+            len(route.get("stops", [])), " + ".join(periods),
+        ]
+        for c, v in enumerate(vals, 1):
+            _cell(ws_comb, r_idx, c, v)
+    for c in range(1, len(cols_comb) + 1):
+        ws_comb.column_dimensions[get_column_letter(c)].width = 18
+    ws_comb.freeze_panes = "A2"
+
+    # ── Véspera sheets ────────────────────────────────────────────────────────
+    ws_eve_r = wb.create_sheet(f"Resumo {eve_label}")
+    _write_resumo(ws_eve_r, eve_routes, fill_eve)
+
+    ws_eve_h = wb.create_sheet(f"Horários {eve_label}")
+    _write_horarios(ws_eve_h, eve_routes, fill_eve)
+
+    # ── Feriado sheets ────────────────────────────────────────────────────────
+    ws_hol_r = wb.create_sheet(f"Resumo {holiday_label}")
+    _write_resumo(ws_hol_r, holiday_routes, fill_hol)
+
+    ws_hol_h = wb.create_sheet(f"Horários {holiday_label}")
+    _write_horarios(ws_hol_h, holiday_routes, fill_hol)
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
+def _parse_time_input(s: str) -> Optional[int]:
+    """Parse 'HH:MM' → minutes. Returns None if invalid."""
+    if not s:
+        return None
+    s = s.strip()
+    try:
+        if ":" in s:
+            h, m = s.split(":", 1)
+            return int(h) * 60 + int(m)
+        return int(s) * 60
+    except (ValueError, AttributeError):
+        return None
+
+
+def tab_rede_feriado():
+    st.header("🗓️ Rede de Feriado")
+    st.markdown(
+        """
+**Lógica de classificação:**
+- A **hora de Apresentação** determina o dia da carreira: se apresenta às 23h de terça, é uma carreira de terça.
+- A periodicidade é comparada com o dia-da-semana real da véspera e do feriado (não são fixos Sexta/Domingo).
+- Carreiras **RIB** → sempre **NÃO**.
+- Centros de recepção com hora de fecho configurada → carreiras cujo **Fim** ultrapasse esse horário ficam **NÃO** automaticamente.
+        """
+    )
+
+    routes = _get_state("routes")
+    if not routes:
+        st.warning("⚠️ Carregue primeiro o ficheiro de rede na tab **Rede**.")
+        return
+
+    routes_dict = {r["carreira"]: r for r in routes}
+
+    # ── 1. Data do feriado ────────────────────────────────────────────────────
+    st.subheader("1. Data do feriado")
+    col_date, col_info = st.columns([1, 2])
+    with col_date:
+        holiday_date = st.date_input(
+            "Data do feriado",
+            value=datetime.date(2025, 6, 4),
+            key="fh_date",
+        )
+    eve_date = holiday_date - datetime.timedelta(days=1)
+    eve_dow  = eve_date.weekday()      # 0=Mon … 6=Sun
+    hol_dow  = holiday_date.weekday()
+
+    _pt_days = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado", "Domingo"]
+    with col_info:
+        st.info(
+            f"🌙 **Véspera:** {eve_date.strftime('%d/%m/%Y')} — **{_pt_days[eve_dow]}**"
+            f"  ·  carreiras com periodicidade que inclui {_pt_days[eve_dow]}\n\n"
+            f"☀️ **Feriado:** {holiday_date.strftime('%d/%m/%Y')} — **{_pt_days[hol_dow]}**"
+            f"  ·  carreiras com periodicidade que inclui {_pt_days[hol_dow]}"
+        )
+
+    exec_col_eve = f"Execução noite de {eve_date.strftime('%d')} para {holiday_date.strftime('%d %b').lower()}"
+    exec_col_hol = f"Execução tarde/noite {holiday_date.strftime('%d %b').lower()}"
+
+    # ── 2. Centros de Recepção — horários de fecho ────────────────────────────
+    st.subheader("2. Horários de fecho dos centros de recepção")
+    st.caption(
+        "Adicione os centros que fecham em horário especial no feriado. "
+        "O nome é comparado com GE Destino e com a Designação da carreira (substring, sem maiúsculas/minúsculas). "
+        "Carreiras cujo **Fim** ultrapasse a hora de fecho ficam **NÃO** automaticamente."
+    )
+
+    if "fh_centros" not in st.session_state:
+        st.session_state["fh_centros"] = []   # list of dicts
+
+    centros_cfg: list[dict] = st.session_state["fh_centros"]
+
+    # Add new centro
+    with st.expander("➕ Adicionar centro de recepção", expanded=not centros_cfg):
+        cc1, cc2, cc3, cc4 = st.columns([2, 1, 1, 1])
+        new_centro  = cc1.text_input("Nome do centro (ex: CO PIN, RIO, Leiria…)", key="fh_c_name")
+        new_period  = cc2.selectbox("Período", ["Véspera", "Feriado", "Ambos"], key="fh_c_period")
+        new_close   = cc3.text_input("Hora de fecho (HH:MM)", placeholder="22:00", key="fh_c_close")
+        if cc4.button("Adicionar", key="fh_c_add"):
+            close_min = _parse_time_input(new_close)
+            if new_centro.strip() and close_min is not None:
+                centros_cfg.append({
+                    "name":        new_centro.strip(),
+                    "period":      new_period,
+                    "close_min":   close_min,
+                    "close_label": new_close.strip(),
+                })
+                st.rerun()
+            else:
+                st.error("Preencha o nome e a hora de fecho (HH:MM).")
+
+    if centros_cfg:
+        df_c = pd.DataFrame([{
+            "Centro": c["name"], "Período": c["period"],
+            "Fecha às": c["close_label"],
+        } for c in centros_cfg])
+        st.dataframe(df_c, hide_index=True, use_container_width=True)
+
+        rm_opts = [f"{c['name']} — {c['period']} às {c['close_label']}" for c in centros_cfg]
+        col_rm1, col_rm2 = st.columns([3, 1])
+        sel_rm = col_rm1.selectbox("Remover centro", [""] + rm_opts, key="fh_c_rm_sel")
+        if col_rm2.button("Remover", key="fh_c_rm_btn") and sel_rm:
+            idx = rm_opts.index(sel_rm)
+            centros_cfg.pop(idx)
+            st.rerun()
+
+    # Split centros by period for later use
+    centros_eve = [c for c in centros_cfg if c["period"] in ("Véspera", "Ambos")]
+    centros_hol = [c for c in centros_cfg if c["period"] in ("Feriado", "Ambos")]
+
+    # ── 3. Build "Rede" rows ──────────────────────────────────────────────────
+    if "fh_overrides_eve" not in st.session_state:
+        st.session_state["fh_overrides_eve"] = {}
+    if "fh_overrides_hol" not in st.session_state:
+        st.session_state["fh_overrides_hol"] = {}
+
+    overrides_eve: dict = st.session_state["fh_overrides_eve"]
+    overrides_hol: dict = st.session_state["fh_overrides_hol"]
+
+    rede_rows_eve = []
+    rede_rows_hol = []
+
+    for route in routes:
+        car = route["carreira"]
+
+        # Auto SIM/NÃO based on actual dow of eve/holiday
+        auto_eve = _feriado_execucao_auto(route, eve_dow)
+        auto_hol = _feriado_execucao_auto(route, hol_dow)
+
+        # Build row first (needed for centro check)
+        row_eve = _route_rede_row(route, auto_eve)
+        row_hol = _route_rede_row(route, auto_hol)
+
+        # Centro de recepção check (only if auto is SIM and no manual override yet)
+        obs_eve, obs_hol = "", ""
+        if auto_eve == "SIM" and car not in overrides_eve:
+            centro_block = _centro_obs(row_eve, centros_eve)
+            if centro_block:
+                auto_eve = "NÃO"
+                obs_eve  = centro_block
+        if auto_hol == "SIM" and car not in overrides_hol:
+            centro_block = _centro_obs(row_hol, centros_hol)
+            if centro_block:
+                auto_hol = "NÃO"
+                obs_hol  = centro_block
+
+        # Apply manual overrides (override wins over centro rule)
+        exec_eve = overrides_eve.get(car, auto_eve)
+        exec_hol = overrides_hol.get(car, auto_hol)
+
+        row_eve["_exec"]       = exec_eve
+        row_eve["Observações"] = obs_eve if car not in overrides_eve else "✏️ Manual"
+        row_eve["_auto"]       = auto_eve
+        row_eve["_overridden"] = car in overrides_eve
+
+        row_hol["_exec"]       = exec_hol
+        row_hol["Observações"] = obs_hol if car not in overrides_hol else "✏️ Manual"
+        row_hol["_auto"]       = auto_hol
+        row_hol["_overridden"] = car in overrides_hol
+
+        rede_rows_eve.append(row_eve)
+        rede_rows_hol.append(row_hol)
+
+    rede_rows_eve.sort(key=lambda r: r["Carreira"])
+    rede_rows_hol.sort(key=lambda r: r["Carreira"])
+
+    st.markdown("---")
+
+    # ── 3. Interactive table + manual override ────────────────────────────────
+    st.subheader("3. Rede de Feriado — SIM / NÃO")
+
+    tab_eve, tab_hol = st.tabs([
+        f"🌙 Véspera {eve_date.strftime('%d/%m')} ({_pt_days[eve_dow]}) — {sum(1 for r in rede_rows_eve if r['_exec']=='SIM')} SIM",
+        f"☀️ Feriado {holiday_date.strftime('%d/%m')} ({_pt_days[hol_dow]}) — {sum(1 for r in rede_rows_hol if r['_exec']=='SIM')} SIM",
+    ])
+
+    def _render_rede_table(rede_rows, overrides, period_key):
+        sim_count  = sum(1 for r in rede_rows if r["_exec"] == "SIM")
+        nao_count  = sum(1 for r in rede_rows if r["_exec"] == "NÃO")
+        over_count = sum(1 for r in rede_rows if r["_overridden"])
+        centro_nao = sum(1 for r in rede_rows if r["Observações"] and "fecha" in r["Observações"].lower())
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("SIM", sim_count)
+        c2.metric("NÃO", nao_count)
+        c3.metric("Bloqueadas por centro", centro_nao)
+        c4.metric("Ajustes manuais", over_count)
+
+        display = []
+        for row in rede_rows:
+            obs = row["Observações"]
+            if row["_rib"] and not obs:
+                obs = "RIB"
+            display.append({
+                "Carreira":      row["Carreira"],
+                "Designação":    row["Designação"],
+                "Rede":          row["Rede"],
+                "Transportador": row["Transportador"],
+                "Periodicidade": row["Periodicidade"],
+                "Apresentação":  row["Apresentação"] or "—",
+                "Inicio":        row["Inicio"] or "—",
+                "Fim":           row["Fim"] or "—",
+                "GE Destino":    row["GE Destino"],
+                "Execução":      row["_exec"],
+                "Observações":   obs,
+            })
+        df = pd.DataFrame(display)
+        st.dataframe(
+            df.style.apply(
+                lambda col: [
+                    "background-color: #C8E6C9" if v == "SIM"
+                    else "background-color: #FFCDD2" if v == "NÃO"
+                    else ""
+                    for v in col
+                ] if col.name == "Execução" else [""] * len(col),
+            ),
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "Execução":   st.column_config.TextColumn(width="small"),
+                "Observações": st.column_config.TextColumn(width="medium"),
+            },
+        )
+
+        # Manual override
+        with st.expander("✏️ Ajustar SIM/NÃO individualmente"):
+            col_car, col_val, col_btn, col_rst = st.columns([3, 1, 1, 1])
+            car_options = {
+                f"{r['Carreira']} — {r['Designação'][:45]}": r["Carreira"]
+                for r in rede_rows
+            }
+            sel_car = col_car.selectbox(
+                "Carreira", [""] + list(car_options.keys()),
+                key=f"fh_{period_key}_car",
+            )
+            sel_val = col_val.selectbox(
+                "Execução", ["SIM", "NÃO"], key=f"fh_{period_key}_val",
+            )
+            if col_btn.button("Aplicar", key=f"fh_{period_key}_apply"):
+                if sel_car:
+                    overrides[car_options[sel_car]] = sel_val
+                    st.rerun()
+            if col_rst.button("Repor todos", key=f"fh_{period_key}_reset"):
+                overrides.clear()
+                st.rerun()
+
+            if overrides:
+                over_rows = [
+                    {"Carreira": car, "Override": val,
+                     "Auto": next((r["_auto"] for r in rede_rows if r["Carreira"] == car), "—")}
+                    for car, val in sorted(overrides.items())
+                ]
+                st.dataframe(pd.DataFrame(over_rows), hide_index=True, use_container_width=True)
+
+    with tab_eve:
+        _render_rede_table(rede_rows_eve, overrides_eve, "eve")
+    with tab_hol:
+        _render_rede_table(rede_rows_hol, overrides_hol, "hol")
+
+    # ── 4. Map ────────────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("4. Mapa da rede de feriado")
+    coordinates = _get_state("coordinates", {})
+    window      = _get_state("connection_window", 90)
+
+    map_tab_eve, map_tab_hol = st.tabs([
+        f"🌙 Mapa Véspera {eve_date.strftime('%d/%m')}",
+        f"☀️ Mapa Feriado {holiday_date.strftime('%d/%m')}",
+    ])
+
+    def _render_holiday_map(rede_rows, map_title):
+        sim_routes = [routes_dict[r["Carreira"]] for r in rede_rows
+                      if r["_exec"] == "SIM" and r["Carreira"] in routes_dict]
+        if not sim_routes:
+            st.info("Nenhuma carreira com SIM para mostrar no mapa.")
+            return
+        with st.spinner("A gerar mapa…"):
+            from src.network import build_dependency_graph as _bdg_fresh
+            try:
+                g = _bdg_fresh(sim_routes, connection_window_min=window)
+            except Exception:
+                g = None
+            fig = _build_map_graph(sim_routes, coordinates, g)
+        fig.update_layout(title=map_title)
+        st.plotly_chart(fig, use_container_width=True)
+
+    with map_tab_eve:
+        _render_holiday_map(rede_rows_eve, f"Rede Véspera {eve_date.strftime('%d/%m/%Y')}")
+    with map_tab_hol:
+        _render_holiday_map(rede_rows_hol, f"Rede Feriado {holiday_date.strftime('%d/%m/%Y')}")
+
+    # ── 5. Export ─────────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("5. Exportar")
+    st.caption("Mesmo formato do ficheiro de referência: folha 'Rede' com coluna Execução colorida.")
+
+    col_xl, col_note = st.columns([1, 2])
+    with col_xl:
+        with st.spinner("A preparar Excel…"):
+            xlsx_bytes = _build_rede_feriado_excel(
+                rede_rows_eve, rede_rows_hol,
+                exec_col_eve, exec_col_hol,
+            )
+        fname_xl = f"Rede_Transportes_feriado_{holiday_date.strftime('%d%b%Y').lower()}.xlsx"
+        st.download_button(
+            label="⬇️ Descarregar Excel (Véspera + Feriado)",
+            data=xlsx_bytes,
+            file_name=fname_xl,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+        )
+    with col_note:
+        n_sim_eve = sum(1 for r in rede_rows_eve if r["_exec"] == "SIM")
+        n_sim_hol = sum(1 for r in rede_rows_hol if r["_exec"] == "SIM")
+        n_nao_eve = sum(1 for r in rede_rows_eve if r["_exec"] == "NÃO")
+        n_nao_hol = sum(1 for r in rede_rows_hol if r["_exec"] == "NÃO")
+        st.markdown(
+            f"**Véspera {eve_date.strftime('%d/%m')} ({_pt_days[eve_dow]}):** {n_sim_eve} SIM · {n_nao_eve} NÃO  \n"
+            f"**Feriado {holiday_date.strftime('%d/%m')} ({_pt_days[hol_dow]}):** {n_sim_hol} SIM · {n_nao_hol} NÃO  \n"
+            f"Ficheiro: `{fname_xl}`"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Main entry point
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
     render_sidebar()
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "📋 Rede Semanal",
-        "⏱️ Análise de Impacto de Atrasos",
-        "🔍 Pesquisa de Carreira",
-        "💡 Sugestões de Encadeamento",
-        "📦 Ocupação & Grupagem",
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        "📋 Rede",
+        "⏱️ Atrasos",
+        "💡 Encadeamento",
+        "✏️ Alterar Carreiras",
+        "📤 Pauta Drivian",
+        "🔧 Correções Drivian",
+        "🗓️ Rede de Feriado",
     ])
 
     with tab1:
         tab_rede_semanal()
-
     with tab2:
         tab_impacto_atrasos()
-
     with tab3:
-        tab_pesquisa_carreira()
-
-    with tab4:
         tab_sugestoes_encadeamento()
-
+    with tab4:
+        tab_alterar_carreiras()
     with tab5:
-        tab_ocupacao_grupagem()
+        tab_gerar_pauta_drivian()
+    with tab6:
+        tab_correcoes_drivian()
+    with tab7:
+        tab_rede_feriado()
 
 
 if __name__ == "__main__":
