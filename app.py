@@ -3775,6 +3775,7 @@ def _parse_time_input(s: str) -> Optional[int]:
 
 def tab_rede_feriado():
     st.header("🗓️ Rede de Feriado")
+    st.caption("⚙️ Tab carregada.")
     st.markdown(
         """
 **Lógica de classificação:**
