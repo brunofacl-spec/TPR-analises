@@ -3821,45 +3821,63 @@ def tab_rede_feriado():
     # ── 2. Centros de Recepção — horários de fecho ────────────────────────────
     st.subheader("2. Horários de fecho dos centros de recepção")
     st.caption(
-        "Adicione os centros que fecham em horário especial no feriado. "
-        "O nome é comparado com GE Destino e com a Designação da carreira (substring, sem maiúsculas/minúsculas). "
-        "Carreiras cujo **Fim** ultrapasse a hora de fecho ficam **NÃO** automaticamente."
+        "Configure os centros de recepção. Carreiras cujo **Fim** ultrapasse a hora de fecho "
+        "ficam **NÃO** automaticamente. O nome é comparado com GE Destino e Designação (substring)."
     )
 
     if "fh_centros" not in st.session_state:
-        st.session_state["fh_centros"] = []   # list of dicts
+        st.session_state["fh_centros"] = []
 
     centros_cfg: list[dict] = st.session_state["fh_centros"]
 
-    # Add new centro
-    with st.expander("➕ Adicionar centro de recepção", expanded=not centros_cfg):
+    # Build dropdown list from GE Destino values in loaded routes
+    _destinos_raw = sorted({
+        r.get("destino", "").strip()
+        for r in routes
+        if r.get("destino", "").strip()
+    })
+    # Also include already-configured names that may not appear in current routes
+    _already = {c["name"] for c in centros_cfg}
+    _destino_opts = sorted(set(_destinos_raw) | _already)
+
+    with st.expander("➕ Configurar centro de recepção", expanded=not centros_cfg):
         cc1, cc2, cc3, cc4 = st.columns([2, 1, 1, 1])
-        new_centro  = cc1.text_input("Nome do centro (ex: CO PIN, RIO, Leiria…)", key="fh_c_name")
-        new_period  = cc2.selectbox("Período", ["Véspera", "Feriado", "Ambos"], key="fh_c_period")
-        new_close   = cc3.text_input("Hora de fecho (HH:MM)", placeholder="22:00", key="fh_c_close")
+        new_centro = cc1.selectbox(
+            "Centro (GE Destino)",
+            [""] + _destino_opts,
+            key="fh_c_name",
+        )
+        new_period = cc2.selectbox("Período", ["Véspera", "Feriado", "Ambos"], key="fh_c_period")
+        new_close  = cc3.text_input("Hora de fecho (HH:MM)", placeholder="22:00", key="fh_c_close")
         if cc4.button("Adicionar", key="fh_c_add"):
             close_min = _parse_time_input(new_close)
-            if new_centro.strip() and close_min is not None:
+            if new_centro and close_min is not None:
+                # Replace existing entry for same name+period if present
+                centros_cfg[:] = [
+                    c for c in centros_cfg
+                    if not (c["name"] == new_centro and c["period"] == new_period)
+                ]
                 centros_cfg.append({
-                    "name":        new_centro.strip(),
+                    "name":        new_centro,
                     "period":      new_period,
                     "close_min":   close_min,
                     "close_label": new_close.strip(),
                 })
                 st.rerun()
             else:
-                st.error("Preencha o nome e a hora de fecho (HH:MM).")
+                st.error("Seleccione o centro e indique a hora de fecho (HH:MM).")
 
     if centros_cfg:
         df_c = pd.DataFrame([{
-            "Centro": c["name"], "Período": c["period"],
+            "Centro": c["name"],
+            "Período": c["period"],
             "Fecha às": c["close_label"],
         } for c in centros_cfg])
         st.dataframe(df_c, hide_index=True, use_container_width=True)
 
         rm_opts = [f"{c['name']} — {c['period']} às {c['close_label']}" for c in centros_cfg]
         col_rm1, col_rm2 = st.columns([3, 1])
-        sel_rm = col_rm1.selectbox("Remover centro", [""] + rm_opts, key="fh_c_rm_sel")
+        sel_rm = col_rm1.selectbox("Remover entrada", [""] + rm_opts, key="fh_c_rm_sel")
         if col_rm2.button("Remover", key="fh_c_rm_btn") and sel_rm:
             idx = rm_opts.index(sel_rm)
             centros_cfg.pop(idx)
