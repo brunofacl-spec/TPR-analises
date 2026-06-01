@@ -4110,7 +4110,12 @@ def main():
     with tab6:
         tab_correcoes_drivian()
     with tab7:
-        tab_rede_feriado()
+        try:
+            tab_rede_feriado()
+        except Exception as _e:
+            import traceback
+            st.error(f"Erro na Rede de Feriado: {_e}")
+            st.code(traceback.format_exc())
 
 
 if __name__ == "__main__":
