@@ -4035,38 +4035,6 @@ def tab_rede_feriado():
     with tab_hol:
         _render_rede_table(rede_rows_hol, overrides_hol, "hol")
 
-    # ── 4. Map ────────────────────────────────────────────────────────────────
-    st.markdown("---")
-    st.subheader("4. Mapa da rede de feriado")
-    coordinates = _get_state("coordinates", {})
-    window      = _get_state("connection_window", 90)
-
-    map_tab_eve, map_tab_hol = st.tabs([
-        f"🌙 Mapa Véspera {eve_date.strftime('%d/%m')}",
-        f"☀️ Mapa Feriado {holiday_date.strftime('%d/%m')}",
-    ])
-
-    def _render_holiday_map(rede_rows, map_title):
-        sim_routes = [routes_dict[r["Carreira"]] for r in rede_rows
-                      if r["_exec"] == "SIM" and r["Carreira"] in routes_dict]
-        if not sim_routes:
-            st.info("Nenhuma carreira com SIM para mostrar no mapa.")
-            return
-        with st.spinner("A gerar mapa…"):
-            from src.network import build_dependency_graph as _bdg_fresh
-            try:
-                g = _bdg_fresh(sim_routes, connection_window_min=window)
-            except Exception:
-                g = None
-            fig = _build_map_graph(sim_routes, coordinates, g)
-        fig.update_layout(title=map_title)
-        st.plotly_chart(fig, use_container_width=True)
-
-    with map_tab_eve:
-        _render_holiday_map(rede_rows_eve, f"Rede Véspera {eve_date.strftime('%d/%m/%Y')}")
-    with map_tab_hol:
-        _render_holiday_map(rede_rows_hol, f"Rede Feriado {holiday_date.strftime('%d/%m/%Y')}")
-
     # ── 5. Export ─────────────────────────────────────────────────────────────
     st.markdown("---")
     st.subheader("5. Exportar")
