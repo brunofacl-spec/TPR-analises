@@ -7,6 +7,12 @@
       "skillPath": ".agents/skills/belt/SKILL.md",
       "computedHash": "49d07aca8deb1f9ada4273c6e065a17219d335b1e7bdf7b11e59f2da6192497c"
     },
+    "gpt-image": {
+      "source": "inference-sh/skills",
+      "sourceType": "github",
+      "skillPath": "tools/image/gpt-image/SKILL.md",
+      "computedHash": "cf2c25703f4e59f093d8be07680acfacd4a13750018c3a94b333de0c17e27d24"
+    },
     "nano-banana-2": {
       "source": "inferen-sh/skills",
       "sourceType": "github",
