@@ -1,6 +1,12 @@
 {
   "version": 1,
   "skills": {
+    "belt": {
+      "source": "belt-sh/cli",
+      "sourceType": "github",
+      "skillPath": ".agents/skills/belt/SKILL.md",
+      "computedHash": "49d07aca8deb1f9ada4273c6e065a17219d335b1e7bdf7b11e59f2da6192497c"
+    },
     "nano-banana-2": {
       "source": "inferen-sh/skills",
       "sourceType": "github",
