@@ -1,6 +1,12 @@
 {
   "version": 1,
   "skills": {
+    "banana": {
+      "source": "AgriciDaniel/banana-claude",
+      "sourceType": "github",
+      "skillPath": "skills/banana/SKILL.md",
+      "computedHash": "2da0cab1df619c69881f011d7c33be9d8383ab956fc0efa946aa26f5dba90907"
+    },
     "belt": {
       "source": "belt-sh/cli",
       "sourceType": "github",
