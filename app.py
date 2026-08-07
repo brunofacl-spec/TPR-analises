@@ -933,23 +933,73 @@ def _build_map_graph_regiao(
 # Metrics helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_SUL_PREFIXES = {"OCS", "SCR", "SEX", "SIB", "OLX", "CO ALG", "CO EV", "CO BEN", "CO PAL"}
-
 def _regiao_label(tp_re: str) -> str:
-    prefix = str(tp_re).split("/")[0].strip().upper()
-    if prefix in _SUL_PREFIXES:
-        return "Sul"
-    if prefix.startswith("OCC") or prefix.startswith("CCR") or prefix.startswith("CEX") or prefix in {
-        "CO AV", "CO CO", "CO LR", "CO PIN", "CO TN", "CO VS"
-    }:
-        return "Centro"
-    if prefix.startswith("OCN") or prefix.startswith("NCR") or prefix.startswith("NEX") or prefix in {
-        "CO BR", "CO RIO"
-    }:
+    """Classify TP/RE value into Norte / Centro / Sul / Ibéria/Outro.
+
+    Rules (in priority order):
+    1. Values with "/" → parse the geographic suffix (OCS/Norte → Norte, OCS/Sul → Sul, etc.)
+    2. First letter of the code: S=Sul, N=Norte, C=Centro
+    3. OC* codes: OCN→Norte, OCC→Centro, OCS→Sul
+    4. CO <city> explicit map
+    5. Known Ibéria codes
+    """
+    val = str(tp_re).strip().upper()
+    if not val:
+        return "Desconhecido"
+
+    # ── Rule 1: slash-separated codes (e.g. "OCS/Norte", "OCS/Sul/Évora") ──
+    if "/" in val:
+        suffix = val.split("/", 1)[1].strip()
+        if suffix.startswith("N"):
+            return "Norte"
+        if suffix.startswith("C"):
+            return "Centro"
+        if suffix.startswith("S") or suffix in {"ÉVORA", "EVORA", "PALMELA", "ALGARVE", "BEJA"}:
+            return "Sul"
+
+    code = val.split("/")[0].strip()
+
+    # ── Rule 2: CO <cidade> explicit map (before first-letter rule) ────────
+    _CO_MAP = {
+        # Sul
+        "CO ALG": "Sul", "CO EV": "Sul", "CO BEN": "Sul",
+        "CO PAL": "Sul", "CO FAR": "Sul", "CO SET": "Sul",
+        # Centro
+        "CO AV": "Centro", "CO CO": "Centro", "CO LR": "Centro",
+        "CO PIN": "Centro", "CO TN": "Centro", "CO VS": "Centro",
+        "CO CB": "Centro", "CO CAS": "Centro", "CO GDA": "Centro",
+        # Norte
+        "CO BR": "Norte", "CO RIO": "Norte", "CO VR": "Norte",
+        "CO VIS": "Norte", "CO GU": "Norte", "CO VC": "Norte",
+        "CO PRT": "Norte", "CO MAT": "Norte",
+        # Ibéria
+        "CO MAD": "Ibéria/Outro", "CO OVD": "Ibéria/Outro",
+        "CO SEV": "Ibéria/Outro", "CO BAR": "Ibéria/Outro",
+    }
+    if code in _CO_MAP:
+        return _CO_MAP[code]
+
+    # ── Rule 3: OC* operational codes ─────────────────────────────────────
+    if code.startswith("OCN"):
         return "Norte"
-    if prefix in {"CO MAD", "TPM", "TPA", "CO OVD", "CO SEV"}:
+    if code.startswith("OCC"):
+        return "Centro"
+    if code.startswith("OCS"):
+        return "Sul"
+
+    # ── Rule 4: first letter of the code (S=Sul, N=Norte, C=Centro) ───────
+    if code.startswith("N"):   # NEX, NCR, …
+        return "Norte"
+    if code.startswith("S"):   # SEX, SCR, SIB, …
+        return "Sul"
+    if code.startswith("C"):   # CEX, CCR, …
+        return "Centro"
+
+    # ── Rule 5: Ibéria ─────────────────────────────────────────────────────
+    if code in {"TPM", "TPA", "OLX"}:
         return "Ibéria/Outro"
-    return prefix or "Desconhecido"
+
+    return code or "Desconhecido"
 
 
 _TURNOS = {
