@@ -543,15 +543,22 @@ def tab_rede_semanal():
     st.markdown("---")
 
     # ── Map graph ────────────────────────────────────────────────────────────
-    st.subheader("Mapa da Rede de Transportes")
-    st.caption("Paragens georreferenciadas com ligações por tipo de rede (R1=azul, R2=verde, R3=laranja)")
-
     coordinates = _get_state("coordinates", {})
     graph = _get_state("graph")
 
-    with st.spinner("A gerar mapa…"):
-        fig_net = _build_map_graph(graph_routes, coordinates, graph)
-    st.plotly_chart(fig_net, use_container_width=True)
+    map_tab1, map_tab2 = st.tabs(["🗺️ Por Tipo de Rede (R1/R2/R3)", "🗺️ Por Região (Norte/Centro/Sul)"])
+
+    with map_tab1:
+        st.caption("Ligações por tipo de rede — R1=azul, R2=verde, R3=laranja")
+        with st.spinner("A gerar mapa…"):
+            fig_net = _build_map_graph(graph_routes, coordinates, graph)
+        st.plotly_chart(fig_net, use_container_width=True)
+
+    with map_tab2:
+        st.caption("Ligações por região geográfica — Norte=azul, Centro=verde, Sul=laranja")
+        with st.spinner("A gerar mapa…"):
+            fig_reg = _build_map_graph_regiao(graph_routes, coordinates, graph)
+        st.plotly_chart(fig_reg, use_container_width=True)
 
     # ── Full route table ─────────────────────────────────────────────────────
     with st.expander("📄 Tabela completa de carreiras"):
@@ -778,6 +785,128 @@ def _build_map_graph(
             title=dict(text="<b>Rede</b>"),
         ),
         title="Rede de Transportes — Portugal",
+    )
+    return fig
+
+
+def _build_map_graph_regiao(
+    routes: list[dict],
+    coordinates: dict[str, tuple[float, float]],
+    graph=None,
+) -> go.Figure:
+    """Map coloured by geographic region (Norte/Centro/Sul) — same palette as rede map."""
+    from collections import Counter, defaultdict
+
+    REGIAO_COLORS = {
+        "Norte":        "#2196F3",  # blue  (same as R1)
+        "Centro":       "#4CAF50",  # green (same as R2)
+        "Sul":          "#FF9800",  # orange (same as R3)
+        "Ibéria/Outro": "#9E9E9E",
+        "Desconhecido": "#9E9E9E",
+    }
+    REGIAO_STYLE = {
+        "Norte":        {"width": 2.2, "opacity": 0.75},
+        "Centro":       {"width": 1.8, "opacity": 0.65},
+        "Sul":          {"width": 1.8, "opacity": 0.65},
+        "Ibéria/Outro": {"width": 1.0, "opacity": 0.40},
+        "Desconhecido": {"width": 1.0, "opacity": 0.35},
+    }
+    REGIAO_ORDER = ["Desconhecido", "Ibéria/Outro", "Sul", "Centro", "Norte"]
+
+    stop_degree: Counter = Counter()
+    if graph is not None:
+        for u, v, d in graph.edges(data=True):
+            stop_degree[d.get("stop", "")] += 1
+
+    edge_lats: dict[str, list] = defaultdict(list)
+    edge_lons: dict[str, list] = defaultdict(list)
+    stop_by_reg: dict[str, dict] = {k: {} for k in REGIAO_COLORS}
+
+    for r in routes:
+        stop_list = r.get("stops", [])
+        regiao = _regiao_label(r.get("regiao", "") or "")
+        reg_key = regiao if regiao in REGIAO_COLORS else "Desconhecido"
+
+        for i, s in enumerate(stop_list):
+            name = s.get("paragem", "")
+            if not name or name not in coordinates:
+                continue
+            lat, lon = coordinates[name]
+            already = any(name in stop_by_reg[k] for k in REGIAO_COLORS)
+            if not already:
+                stop_by_reg[reg_key][name] = {"lat": lat, "lon": lon, "carreiras": []}
+            for k in REGIAO_COLORS:
+                if name in stop_by_reg[k]:
+                    stop_by_reg[k][name]["carreiras"].append(r.get("carreira"))
+
+            if i > 0:
+                prev = stop_list[i - 1].get("paragem", "")
+                if prev in coordinates:
+                    plat, plon = coordinates[prev]
+                    clat, clon = coordinates[name]
+                    edge_lats[reg_key] += [plat, clat, None]
+                    edge_lons[reg_key] += [plon, clon, None]
+
+    fig = go.Figure()
+
+    for reg_key in REGIAO_ORDER:
+        if reg_key not in edge_lats:
+            continue
+        color = REGIAO_COLORS[reg_key]
+        style = REGIAO_STYLE[reg_key]
+        fig.add_trace(go.Scattermapbox(
+            lat=edge_lats[reg_key],
+            lon=edge_lons[reg_key],
+            mode="lines",
+            line=dict(width=style["width"], color=_hex_to_rgba(color, style["opacity"])),
+            name=reg_key,
+            hoverinfo="none",
+            legendgroup=reg_key,
+            showlegend=True,
+        ))
+
+    all_degs = [stop_degree.get(n, 0) for k in REGIAO_COLORS for n in stop_by_reg[k]]
+    max_deg = max(all_degs) if all_degs else 1
+
+    for reg_key in ["Norte", "Centro", "Sul", "Ibéria/Outro", "Desconhecido"]:
+        stops = stop_by_reg[reg_key]
+        if not stops:
+            continue
+        color = REGIAO_COLORS[reg_key]
+        names_k  = list(stops.keys())
+        lats_k   = [stops[n]["lat"] for n in names_k]
+        lons_k   = [stops[n]["lon"] for n in names_k]
+        degs_k   = [stop_degree.get(n, 0) for n in names_k]
+        sizes_k  = [6 + 16 * (d / max_deg) for d in degs_k]
+        nrts_k   = [len(set(stops[n]["carreiras"])) for n in names_k]
+        hover_k  = [
+            f"<b>{n}</b><br>Região: {reg_key}<br>Carreiras: {nr}<br>Ligações: {d}"
+            for n, nr, d in zip(names_k, nrts_k, degs_k)
+        ]
+        fig.add_trace(go.Scattermapbox(
+            lat=lats_k, lon=lons_k,
+            mode="markers",
+            marker=dict(size=sizes_k, color=color, opacity=0.9, sizemode="diameter"),
+            hovertemplate="%{customdata}<extra></extra>",
+            customdata=hover_k,
+            name=reg_key,
+            legendgroup=reg_key,
+            showlegend=False,
+        ))
+
+    fig.update_layout(
+        mapbox=dict(style="open-street-map", center=dict(lat=39.8, lon=-6.5), zoom=5.0),
+        height=720,
+        margin=dict(l=0, r=0, t=30, b=0),
+        legend=dict(
+            bgcolor="rgba(255,255,255,0.85)",
+            bordercolor="#ccc",
+            borderwidth=1,
+            x=0.01, y=0.99,
+            xanchor="left", yanchor="top",
+            title=dict(text="<b>Região</b>"),
+        ),
+        title="Rede de Transportes — Por Região",
     )
     return fig
 
