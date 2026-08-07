@@ -543,15 +543,22 @@ def tab_rede_semanal():
     st.markdown("---")
 
     # ── Map graph ────────────────────────────────────────────────────────────
-    st.subheader("Mapa da Rede de Transportes")
-    st.caption("Paragens georreferenciadas com ligações por tipo de rede (R1=azul, R2=verde, R3=laranja)")
-
     coordinates = _get_state("coordinates", {})
     graph = _get_state("graph")
 
-    with st.spinner("A gerar mapa…"):
-        fig_net = _build_map_graph(graph_routes, coordinates, graph)
-    st.plotly_chart(fig_net, use_container_width=True)
+    map_tab1, map_tab2 = st.tabs(["🗺️ Por Tipo de Rede (R1/R2/R3)", "🗺️ Por Região (Norte/Centro/Sul)"])
+
+    with map_tab1:
+        st.caption("Ligações por tipo de rede — R1=azul, R2=verde, R3=laranja")
+        with st.spinner("A gerar mapa…"):
+            fig_net = _build_map_graph(graph_routes, coordinates, graph)
+        st.plotly_chart(fig_net, use_container_width=True)
+
+    with map_tab2:
+        st.caption("Ligações por região geográfica — Norte=azul, Centro=verde, Sul=laranja")
+        with st.spinner("A gerar mapa…"):
+            fig_reg = _build_map_graph_regiao(graph_routes, coordinates, graph)
+        st.plotly_chart(fig_reg, use_container_width=True)
 
     # ── Full route table ─────────────────────────────────────────────────────
     with st.expander("📄 Tabela completa de carreiras"):
@@ -647,46 +654,57 @@ def _build_map_graph(
     """Build a Plotly Scattermapbox with stops on the Portugal map.
 
     Edges = route segments between consecutive stops (coloured by rede).
-    Nodes = stops sized by number of connections in the dependency graph.
+    Nodes = stops per rede type, sized by dependency degree.
     """
     from collections import Counter, defaultdict
 
-    # Compute stop degree from dependency graph (how many connections each stop has)
+    # Line width and opacity per rede tier
+    REDE_STYLE = {
+        "R1": {"width": 2.5, "opacity": 0.75},
+        "R2": {"width": 1.8, "opacity": 0.65},
+        "R3": {"width": 1.2, "opacity": 0.55},
+        "":   {"width": 1.0, "opacity": 0.40},
+    }
+    REDE_LABELS = {
+        "R1": "R1 — Linhas Primárias",
+        "R2": "R2 — Linhas Secundárias",
+        "R3": "R3 — Linhas Terciárias",
+        "":   "Outro",
+    }
+
+    # Compute stop degree from dependency graph
     stop_degree: Counter = Counter()
     if graph is not None:
         for u, v, d in graph.edges(data=True):
             stop_degree[d.get("stop", "")] += 1
 
-    # Collect route segments per rede type (only between stops with coordinates)
+    # Collect route segments and stops per rede
     edge_lats: dict[str, list] = defaultdict(list)
     edge_lons: dict[str, list] = defaultdict(list)
-
-    # Collect unique stops
-    stop_info: dict[str, dict] = {}
+    # stop_info per rede: {rede_key: {stop_name: {lat, lon, carreiras, degree}}}
+    stop_by_rede: dict[str, dict] = {k: {} for k in REDE_COLORS}
 
     for r in routes:
         stop_list = r.get("stops", [])
-        rede = r.get("rede", "").split()[0] if r.get("rede") else ""  # R1/R2/R3
+        rede = r.get("rede", "").split()[0] if r.get("rede") else ""
         rede_key = rede if rede in REDE_COLORS else ""
 
         for i, s in enumerate(stop_list):
             name = s.get("paragem", "")
-            if not name:
+            if not name or name not in coordinates:
                 continue
-            if name not in stop_info and name in coordinates:
-                lat, lon = coordinates[name]
-                stop_info[name] = {
-                    "lat": lat, "lon": lon,
-                    "rede": rede_key,
-                    "carreiras": [],
-                }
-            if name in stop_info:
-                stop_info[name]["carreiras"].append(r.get("carreira"))
+            lat, lon = coordinates[name]
+            # Register stop under its rede (first rede wins)
+            already = any(name in stop_by_rede[k] for k in REDE_COLORS)
+            if not already:
+                stop_by_rede[rede_key][name] = {"lat": lat, "lon": lon, "carreiras": []}
+            for k in REDE_COLORS:
+                if name in stop_by_rede[k]:
+                    stop_by_rede[k][name]["carreiras"].append(r.get("carreira"))
 
-            # Draw edge from previous stop
             if i > 0:
                 prev = stop_list[i - 1].get("paragem", "")
-                if prev in coordinates and name in coordinates:
+                if prev in coordinates:
                     plat, plon = coordinates[prev]
                     clat, clon = coordinates[name]
                     edge_lats[rede_key] += [plat, clat, None]
@@ -694,56 +712,62 @@ def _build_map_graph(
 
     fig = go.Figure()
 
-    # Edge traces (one per rede type, thin semi-transparent lines)
-    rede_labels = {"R1": "R1 (Principal)", "R2": "R2 (Secundária)",
-                   "R3": "R3 (Terciária)", "": "Outro"}
-    for rede_key, color in REDE_COLORS.items():
+    # ── Edge traces (one per rede, ordered R1→R3 so R1 renders on top) ─────
+    for rede_key in ["", "R3", "R2", "R1"]:
+        color = REDE_COLORS[rede_key]
+        style = REDE_STYLE[rede_key]
         if rede_key not in edge_lats:
             continue
-        rgba = _hex_to_rgba(color, 0.25)
+        rgba = _hex_to_rgba(color, style["opacity"])
         fig.add_trace(go.Scattermapbox(
             lat=edge_lats[rede_key],
             lon=edge_lons[rede_key],
             mode="lines",
-            line=dict(width=1, color=rgba),
-            name=rede_labels.get(rede_key, rede_key),
+            line=dict(width=style["width"], color=rgba),
+            name=REDE_LABELS[rede_key],
             hoverinfo="none",
+            legendgroup=rede_key or "outro",
             showlegend=True,
         ))
 
-    # Node trace — size proportional to dependency degree
-    if stop_info:
-        lats = [stop_info[n]["lat"] for n in stop_info]
-        lons = [stop_info[n]["lon"] for n in stop_info]
-        names = list(stop_info.keys())
-        colors = [REDE_COLORS.get(stop_info[n]["rede"], "#9E9E9E") for n in names]
-        degrees = [stop_degree.get(n, 0) for n in names]
-        max_deg = max(degrees) if degrees else 1
-        sizes = [6 + 18 * (d / max(max_deg, 1)) for d in degrees]
-        n_routes = [len(set(stop_info[n]["carreiras"])) for n in names]
-        hover = [
-            f"<b>{n}</b><br>Carreiras: {nr}<br>Ligações (dependências): {d}"
-            for n, nr, d in zip(names, n_routes, degrees)
-        ]
+    # ── Node traces (one per rede so legend groups work) ────────────────────
+    all_degrees = [stop_degree.get(n, 0)
+                   for k in REDE_COLORS for n in stop_by_rede[k]]
+    max_deg = max(all_degrees) if all_degrees else 1
 
+    for rede_key in ["R1", "R2", "R3", ""]:
+        stops = stop_by_rede[rede_key]
+        if not stops:
+            continue
+        color = REDE_COLORS[rede_key]
+        names_k = list(stops.keys())
+        lats_k  = [stops[n]["lat"] for n in names_k]
+        lons_k  = [stops[n]["lon"] for n in names_k]
+        degs_k  = [stop_degree.get(n, 0) for n in names_k]
+        sizes_k = [6 + 16 * (d / max_deg) for d in degs_k]
+        n_routes_k = [len(set(stops[n]["carreiras"])) for n in names_k]
+        hover_k = [
+            f"<b>{n}</b><br>Rede: {rede_key or '?'}<br>"
+            f"Carreiras: {nr}<br>Ligações: {d}"
+            for n, nr, d in zip(names_k, n_routes_k, degs_k)
+        ]
         fig.add_trace(go.Scattermapbox(
-            lat=lats,
-            lon=lons,
+            lat=lats_k,
+            lon=lons_k,
             mode="markers",
             marker=dict(
-                size=sizes,
-                color=colors,
-                opacity=0.85,
+                size=sizes_k,
+                color=color,
+                opacity=0.9,
                 sizemode="diameter",
             ),
-            text=names,
             hovertemplate="%{customdata}<extra></extra>",
-            customdata=hover,
-            name="Paragens",
-            showlegend=True,
+            customdata=hover_k,
+            name=REDE_LABELS[rede_key],
+            legendgroup=rede_key or "outro",
+            showlegend=False,  # edges already carry the legend entry
         ))
 
-    # Península Ibérica centrada em Portugal
     fig.update_layout(
         mapbox=dict(
             style="open-street-map",
@@ -758,8 +782,131 @@ def _build_map_graph(
             borderwidth=1,
             x=0.01, y=0.99,
             xanchor="left", yanchor="top",
+            title=dict(text="<b>Rede</b>"),
         ),
-        title="Rede de Transportes — Península Ibérica",
+        title="Rede de Transportes — Portugal",
+    )
+    return fig
+
+
+def _build_map_graph_regiao(
+    routes: list[dict],
+    coordinates: dict[str, tuple[float, float]],
+    graph=None,
+) -> go.Figure:
+    """Map coloured by geographic region (Norte/Centro/Sul) — same palette as rede map."""
+    from collections import Counter, defaultdict
+
+    REGIAO_COLORS = {
+        "Norte":        "#2196F3",  # blue  (same as R1)
+        "Centro":       "#4CAF50",  # green (same as R2)
+        "Sul":          "#FF9800",  # orange (same as R3)
+        "Ibéria/Outro": "#9E9E9E",
+        "Desconhecido": "#9E9E9E",
+    }
+    REGIAO_STYLE = {
+        "Norte":        {"width": 2.2, "opacity": 0.75},
+        "Centro":       {"width": 1.8, "opacity": 0.65},
+        "Sul":          {"width": 1.8, "opacity": 0.65},
+        "Ibéria/Outro": {"width": 1.0, "opacity": 0.40},
+        "Desconhecido": {"width": 1.0, "opacity": 0.35},
+    }
+    REGIAO_ORDER = ["Desconhecido", "Ibéria/Outro", "Sul", "Centro", "Norte"]
+
+    stop_degree: Counter = Counter()
+    if graph is not None:
+        for u, v, d in graph.edges(data=True):
+            stop_degree[d.get("stop", "")] += 1
+
+    edge_lats: dict[str, list] = defaultdict(list)
+    edge_lons: dict[str, list] = defaultdict(list)
+    stop_by_reg: dict[str, dict] = {k: {} for k in REGIAO_COLORS}
+
+    for r in routes:
+        stop_list = r.get("stops", [])
+        regiao = _regiao_label(r.get("regiao", "") or "")
+        reg_key = regiao if regiao in REGIAO_COLORS else "Desconhecido"
+
+        for i, s in enumerate(stop_list):
+            name = s.get("paragem", "")
+            if not name or name not in coordinates:
+                continue
+            lat, lon = coordinates[name]
+            already = any(name in stop_by_reg[k] for k in REGIAO_COLORS)
+            if not already:
+                stop_by_reg[reg_key][name] = {"lat": lat, "lon": lon, "carreiras": []}
+            for k in REGIAO_COLORS:
+                if name in stop_by_reg[k]:
+                    stop_by_reg[k][name]["carreiras"].append(r.get("carreira"))
+
+            if i > 0:
+                prev = stop_list[i - 1].get("paragem", "")
+                if prev in coordinates:
+                    plat, plon = coordinates[prev]
+                    clat, clon = coordinates[name]
+                    edge_lats[reg_key] += [plat, clat, None]
+                    edge_lons[reg_key] += [plon, clon, None]
+
+    fig = go.Figure()
+
+    for reg_key in REGIAO_ORDER:
+        if reg_key not in edge_lats:
+            continue
+        color = REGIAO_COLORS[reg_key]
+        style = REGIAO_STYLE[reg_key]
+        fig.add_trace(go.Scattermapbox(
+            lat=edge_lats[reg_key],
+            lon=edge_lons[reg_key],
+            mode="lines",
+            line=dict(width=style["width"], color=_hex_to_rgba(color, style["opacity"])),
+            name=reg_key,
+            hoverinfo="none",
+            legendgroup=reg_key,
+            showlegend=True,
+        ))
+
+    all_degs = [stop_degree.get(n, 0) for k in REGIAO_COLORS for n in stop_by_reg[k]]
+    max_deg = max(all_degs) if all_degs else 1
+
+    for reg_key in ["Norte", "Centro", "Sul", "Ibéria/Outro", "Desconhecido"]:
+        stops = stop_by_reg[reg_key]
+        if not stops:
+            continue
+        color = REGIAO_COLORS[reg_key]
+        names_k  = list(stops.keys())
+        lats_k   = [stops[n]["lat"] for n in names_k]
+        lons_k   = [stops[n]["lon"] for n in names_k]
+        degs_k   = [stop_degree.get(n, 0) for n in names_k]
+        sizes_k  = [6 + 16 * (d / max_deg) for d in degs_k]
+        nrts_k   = [len(set(stops[n]["carreiras"])) for n in names_k]
+        hover_k  = [
+            f"<b>{n}</b><br>Região: {reg_key}<br>Carreiras: {nr}<br>Ligações: {d}"
+            for n, nr, d in zip(names_k, nrts_k, degs_k)
+        ]
+        fig.add_trace(go.Scattermapbox(
+            lat=lats_k, lon=lons_k,
+            mode="markers",
+            marker=dict(size=sizes_k, color=color, opacity=0.9, sizemode="diameter"),
+            hovertemplate="%{customdata}<extra></extra>",
+            customdata=hover_k,
+            name=reg_key,
+            legendgroup=reg_key,
+            showlegend=False,
+        ))
+
+    fig.update_layout(
+        mapbox=dict(style="open-street-map", center=dict(lat=39.8, lon=-6.5), zoom=5.0),
+        height=720,
+        margin=dict(l=0, r=0, t=30, b=0),
+        legend=dict(
+            bgcolor="rgba(255,255,255,0.85)",
+            bordercolor="#ccc",
+            borderwidth=1,
+            x=0.01, y=0.99,
+            xanchor="left", yanchor="top",
+            title=dict(text="<b>Região</b>"),
+        ),
+        title="Rede de Transportes — Por Região",
     )
     return fig
 
