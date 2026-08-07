@@ -546,7 +546,10 @@ def tab_rede_semanal():
     coordinates = _get_state("coordinates", {})
     graph = _get_state("graph")
 
-    map_tab1, map_tab2 = st.tabs(["🗺️ Por Tipo de Rede (R1/R2/R3)", "🗺️ Por Região (Norte/Centro/Sul)"])
+    map_tab1, map_tab2, map_tab3, map_tab4, map_tab5 = st.tabs([
+        "🗺️ R1/R2/R3", "🗺️ Norte/Centro/Sul",
+        "🗺️ Norte", "🗺️ Centro", "🗺️ Sul",
+    ])
 
     with map_tab1:
         st.caption("Ligações por tipo de rede — R1=azul, R2=verde, R3=laranja")
@@ -559,6 +562,18 @@ def tab_rede_semanal():
         with st.spinner("A gerar mapa…"):
             fig_reg = _build_map_graph_regiao(graph_routes, coordinates, graph)
         st.plotly_chart(fig_reg, use_container_width=True)
+
+    for map_tab, regiao_name, center_lat, center_lon, zoom in [
+        (map_tab3, "Norte",  41.5, -8.2, 6.8),
+        (map_tab4, "Centro", 40.0, -8.0, 6.5),
+        (map_tab5, "Sul",    37.5, -8.2, 6.5),
+    ]:
+        with map_tab:
+            routes_regiao = [r for r in graph_routes if _regiao_label(r.get("regiao", "") or "") == regiao_name]
+            st.caption(f"{len(routes_regiao)} carreiras na região {regiao_name} — cores por R1/R2/R3")
+            with st.spinner(f"A gerar mapa {regiao_name}…"):
+                fig_r = _build_map_graph(routes_regiao, coordinates, graph, center_lat=center_lat, center_lon=center_lon, zoom=zoom)
+            st.plotly_chart(fig_r, use_container_width=True)
 
     # ── Full route table ─────────────────────────────────────────────────────
     with st.expander("📄 Tabela completa de carreiras"):
@@ -650,6 +665,9 @@ def _build_map_graph(
     routes: list[dict],
     coordinates: dict[str, tuple[float, float]],
     graph=None,
+    center_lat: float = 39.8,
+    center_lon: float = -6.5,
+    zoom: float = 5.0,
 ) -> go.Figure:
     """Build a Plotly Scattermapbox with stops on the Portugal map.
 
@@ -771,8 +789,8 @@ def _build_map_graph(
     fig.update_layout(
         mapbox=dict(
             style="open-street-map",
-            center=dict(lat=39.8, lon=-6.5),
-            zoom=5.0,
+            center=dict(lat=center_lat, lon=center_lon),
+            zoom=zoom,
         ),
         height=720,
         margin=dict(l=0, r=0, t=30, b=0),
